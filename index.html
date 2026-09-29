@@ -602,7 +602,32 @@ function AgendaDia({dia,setDia,agenda,onEdit}){
 
 /* ---------- Tablero ---------- */
 function VistaTablero({registros,now,onEdit}){
-  return (<div className="flex gap-3 overflow-x-auto pb-2">{ESTATUS.map(est=>{const items=registros.filter(r=>r.estatus===est);return (<div key={est} className="min-w-[200px] flex-1"><div className="flex items-center gap-2 mb-2 px-1"><span className={`h-2 w-2 rounded-full ${ESTATUS_COLOR[est].spine}`}></span><h3 className="text-xs font-bold uppercase tracking-wide text-slate-600 leading-tight">{est}</h3><span className="ml-auto text-xs text-slate-400 mono">{items.length}</span></div><div className="space-y-2">{items.map(r=><TarjetaMini key={r.id} r={r} now={now} onEdit={onEdit}/>)}{items.length===0 && <div className="rounded-lg border border-dashed border-stone-300 py-6 text-center text-xs text-slate-400">—</div>}</div></div>);})}</div>);
+  const panel=React.useRef(null), pista=React.useRef(null), arrastre=React.useRef(null);
+  const [m,setM]=useState({ancho:0,visible:0,pos:0});
+  const medir=React.useCallback(()=>{const p=panel.current;if(!p)return;setM({ancho:p.scrollWidth,visible:p.clientWidth,pos:p.scrollLeft});},[]);
+  useEffect(()=>{medir();let ro=null;const p=panel.current;
+    if(window.ResizeObserver&&p){ro=new ResizeObserver(medir);ro.observe(p);}
+    window.addEventListener("resize",medir);
+    return()=>{if(ro)ro.disconnect();window.removeEventListener("resize",medir);};},[registros,medir]);
+  const sobra=Math.max(0,m.ancho-m.visible);
+  const anchoPulgar=m.ancho>0?Math.max(8,(m.visible/m.ancho)*100):100;
+  const izqPulgar=sobra>0?(m.pos/sobra)*(100-anchoPulgar):0;
+  const irA=(clientX,rect)=>{const p=panel.current;if(!p||sobra<=0)return;
+    const libre=rect.width*(1-anchoPulgar/100);
+    const x=Math.min(Math.max(clientX-rect.left-(rect.width*anchoPulgar/100)/2,0),libre);
+    p.scrollLeft=(libre>0?x/libre:0)*sobra;};
+  const alBajar=e=>{const pista0=pista.current;if(!pista0)return;const rect=pista0.getBoundingClientRect();
+    irA(e.clientX,rect);arrastre.current=rect;
+    const mover=ev=>irA(ev.clientX,arrastre.current);
+    const soltar=()=>{arrastre.current=null;window.removeEventListener("pointermove",mover);window.removeEventListener("pointerup",soltar);};
+    window.addEventListener("pointermove",mover);window.addEventListener("pointerup",soltar);};
+  return (<div>
+    {sobra>0 && <div ref={pista} onPointerDown={alBajar} role="scrollbar" aria-label="Desplazar el tablero" aria-orientation="horizontal" title="Arrastra para ver las demás etapas"
+      className="mb-2 h-3 w-full cursor-pointer rounded-full bg-stone-200 select-none touch-none">
+      <div className="h-3 rounded-full bg-navy transition-[left] duration-75" style={{width:anchoPulgar+"%",marginLeft:izqPulgar+"%"}}></div>
+    </div>}
+    <div ref={panel} onScroll={medir} className="flex gap-3 overflow-x-auto pb-2">{ESTATUS.map(est=>{const items=registros.filter(r=>r.estatus===est);return (<div key={est} className="min-w-[200px] flex-1"><div className="flex items-center gap-2 mb-2 px-1"><span className={`h-2 w-2 rounded-full ${ESTATUS_COLOR[est].spine}`}></span><h3 className="text-xs font-bold uppercase tracking-wide text-slate-600 leading-tight">{est}</h3><span className="ml-auto text-xs text-slate-400 mono">{items.length}</span></div><div className="space-y-2">{items.map(r=><TarjetaMini key={r.id} r={r} now={now} onEdit={onEdit}/>)}{items.length===0 && <div className="rounded-lg border border-dashed border-stone-300 py-6 text-center text-xs text-slate-400">—</div>}</div></div>);})}</div>
+  </div>);
 }
 
 /* ---------- Lista ---------- */
