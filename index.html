@@ -78,6 +78,14 @@ async function apiDictaminado(id,nota){return await sbRpcU("sc_marcar_dictaminad
 async function apiEnviarContratos(id){return await sbRpcU("sc_enviar_contratos",{p_cliente:id},1);}
 const ES_LEGAL=()=>!!(USUARIO&&USUARIO.legal);
 const TIPO_PERSONA=["Persona física","Persona moral"];
+const DOCS_LEGALES=["Acta constitutiva","Constancia de situación fiscal del cliente","Asambleas","Poder del representante legal"];
+const DOC_DICTAMEN="Dictamen legal";
+const DOCS_POSTERIORES=["Contrato firmado","Contrato en físico","Videos de Firma"];
+function listoParaDictamen(r){
+  const req=r.requisitos||{};
+  return reqListFor(r.tipoCliente).filter(k=>DOCS_POSTERIORES.indexOf(k)<0)
+    .every(k=>["recibido","na"].indexOf(req[k]||"pendiente")>=0);
+}
 const PLAZO_DICTAMEN=3;
 function diasDesde(s){if(!s)return null;const d=Math.floor((Date.now()-new Date(s).getTime())/86400000);return isNaN(d)?null:Math.max(0,d);}
 function enDictamen(r){return (r.estatuses||[]).includes("En Dictamen")&&!(r.estatuses||[]).includes("Dictaminado");}
@@ -160,7 +168,7 @@ const CONTACTO=["Contestó","No contestó"];
 const TIPOS=["Llamada","Correo","WhatsApp","Visita","Reunión"];
 const TIPO_ABBR={"Llamada":"LLAM","Correo":"MAIL","WhatsApp":"WA","Visita":"VIS","Reunión":"REU"};
 
-const REQ_NUEVO=["Identificación del cliente","Identificación del aval","Comprobante de domicilio del cliente","Comprobante de domicilio del aval","Constancia de situación fiscal del cliente","Constancia de situación fiscal del aval","Opinión de cumplimiento del cliente o de la empresa","Acta constitutiva","Poder del representante legal","Comprobante de ingresos","Referencias comerciales","Contrato firmado","Contrato en físico","Video fachada","Fotos","Videos de Firma"];
+const REQ_NUEVO=["Identificación del cliente","Identificación del aval","Comprobante de domicilio del cliente","Comprobante de domicilio del aval","Constancia de situación fiscal del cliente","Constancia de situación fiscal del aval","Opinión de cumplimiento del cliente o de la empresa","Acta constitutiva","Asambleas","Poder del representante legal","Comprobante de ingresos","Referencias comerciales","Contrato firmado","Contrato en físico","Video fachada","Fotos","Videos de Firma"];
 const REQ_RECURRENTE=["Constancia Actualizada Cliente y Aval","Comprobante de Domicilio Cliente y Aval","Opinión de cumplimiento"];
 const REQ_ALL=[...REQ_NUEVO,...REQ_RECURRENTE];
 const REQ_MAP={}; REQ_ALL.forEach(r=>REQ_MAP[quita(r)]=r); REQ_MAP["video"]="Video fachada"; REQ_MAP["identificacion oficial"]="Identificación del cliente"; REQ_MAP["comprobante de domicilio"]="Comprobante de domicilio del cliente"; REQ_MAP["constancia de situacion fiscal"]="Constancia de situación fiscal del cliente";
@@ -592,7 +600,8 @@ function App(){
         {vista==="dia" && <AgendaDia dia={dia} setDia={setDia} agenda={agenda} onEdit={setEditando}/>}
       </main>
 
-      {editando && <Modal onCambiado={recargar} puedeEditar={puedeEditar} inicial={editando==="nuevo"?null:editando} fEjec={fEjec} ejecutivos={ejecutivos} cliPorEjec={cliPorEjec} onClose={()=>setEditando(null)} onSave={guardar}/>}
+      {editando && ES_LEGAL() && editando!=="nuevo" && <FichaLegal r={editando} onClose={()=>setEditando(null)} onCambio={()=>{setEditando(null);recargar();}}/>}
+      {editando && !ES_LEGAL() && <Modal onCambiado={recargar} puedeEditar={puedeEditar} inicial={editando==="nuevo"?null:editando} fEjec={fEjec} ejecutivos={ejecutivos} cliPorEjec={cliPorEjec} onClose={()=>setEditando(null)} onSave={guardar}/>}
     </div>
   );
 }
@@ -839,10 +848,102 @@ function Modal({inicial,fEjec,ejecutivos,cliPorEjec,onClose,onSave,puedeEditar,o
         <Campo label="Patio de entrega"><select value={f.patioEntrega} onChange={e=>set("patioEntrega",e.target.value)} className={inp}><option value="">— Selecciona patio —</option>{PATIOS.map(p=><option key={p}>{p}</option>)}</select></Campo>
         <div className="grid grid-cols-2 gap-3"><Campo label="Entrega de fábrica o taller" hint="Cuándo llega el equipo"><input type="date" value={f.entregaFabrica} onChange={e=>set("entregaFabrica",e.target.value)} className={inp}/></Campo><Campo label="Fecha de entrega al cliente"><input type="date" value={f.entregaProgramada} onChange={e=>set("entregaProgramada",e.target.value)} className={inp}/></Campo></div>
         <Campo label="Notas (opcional)"><textarea value={f.notas} onChange={e=>set("notas",e.target.value)} rows={2} className={inp}/></Campo>
-        {inicial && inicial.id>0 && USUARIO && <BloqueDictamen r={inicial} expedienteCompleto={st.completo} onCambio={onCambiado}/>}
+        {inicial && inicial.id>0 && USUARIO && <BloqueDictamen r={{...inicial,requisitos:f.requisitos,tipoCliente:f.tipoCliente,tipoPersona:f.tipoPersona}} expedienteCompleto={listoParaDictamen({...inicial,requisitos:f.requisitos,tipoCliente:f.tipoCliente})} onCambio={onCambiado}/>}
         {inicial && inicial.id>0 && USUARIO && <HistorialCambios id={inicial.id}/>}
       </div>
       <div className="sticky bottom-0 flex justify-end gap-2 border-t border-stone-200 bg-white px-5 py-3"><button onClick={onClose} className="rounded-lg px-3.5 py-2 text-sm font-semibold text-slate-600 hover:bg-stone-100">Cancelar</button><button onClick={()=>valido&&guardarLimpio()} disabled={!valido||!puedeEditar} title={puedeEditar?"":"Modo consulta: no puedes guardar"} className="rounded-lg border border-lime bg-lime px-5 py-2 text-sm font-bold text-lime-dark hover:brightness-95 disabled:opacity-40">{inicial?"Guardar cambios":"Crear cliente"}</button></div>
+    </div>
+  </div>);
+}
+
+/* ---------- Ficha reducida para el área legal ---------- */
+function FichaLegal({r, onClose, onCambio}){
+  const [archivos,setArchivos]=useState(()=>JSON.parse(JSON.stringify(r.archivos||{})));
+  const [subiendo,setSubiendo]=useState("");const [nota,setNota]=useState("");
+  const [err,setErr]=useState("");const [msg,setMsg]=useState("");const [ocupado,setOcupado]=useState(false);
+  const dias=diasDesde(r.enviadoLegal);
+  const vencido=enDictamen(r)&&dias!=null&&dias>PLAZO_DICTAMEN;
+  const tieneDictamen=((archivos[DOC_DICTAMEN])||[]).length>0;
+  async function subir(docKey,file){
+    try{setSubiendo(docKey);setErr("");
+      const c=await comprimir(file);
+      const j=await apiUpload(String(r.cliente||"").trim(), docKey, c.nombre, c.mime, c.b64);
+      const nuevos={...archivos,[docKey]:[...((archivos[docKey])||[]),{id:j.id,url:j.url,nombre:c.nombre,fecha:HOY}]};
+      setArchivos(nuevos);
+      await apiSave({...r, archivos:nuevos});
+    }catch(e){setErr("No se pudo subir: "+e.message);}finally{setSubiendo("");}
+  }
+  async function dictaminar(){
+    if(ocupado)return;
+    if(!tieneDictamen){setErr("Primero sube el archivo del dictamen.");return;}
+    setOcupado(true);setErr("");
+    try{ await apiDictaminado(r.id, nota.trim()); setMsg("Dictamen enviado a Servicio a Clientes."); setTimeout(()=>onCambio&&onCambio(),900); }
+    catch(e){ setErr(e.message); } finally{ setOcupado(false); }
+  }
+  const Doc=({k, destacado})=>{
+    const lista=(archivos[k])||[];
+    return (<div className={`rounded-lg border p-3 ${destacado?"border-lime bg-lime-soft/40":"border-stone-200"}`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-sm font-semibold text-navy">{k}{lista.length>0 && <span className="ml-2 rounded-full bg-navy px-2 py-0.5 text-[10px] font-bold text-white">{lista.length}</span>}</span>
+        <div className="flex gap-1.5">
+          <label className="cursor-pointer rounded-md border border-emerald-300 bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100">📷 Cámara
+            <input type="file" accept="image/*" capture="environment" className="hidden" onChange={e=>{const fl=e.target.files[0];if(fl)subir(k,fl);e.target.value="";}}/></label>
+          <label className="cursor-pointer rounded-md border border-stone-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-stone-50">📎 Archivo
+            <input type="file" accept="image/*,application/pdf" className="hidden" onChange={e=>{const fl=e.target.files[0];if(fl)subir(k,fl);e.target.value="";}}/></label>
+        </div>
+      </div>
+      {subiendo===k && <p className="mt-1 text-[11px] font-semibold text-sky-600">Subiendo…</p>}
+      {lista.length>0
+        ? <ul className="mt-2 space-y-1">{lista.map((a,i)=>(<li key={i} className="text-xs"><a className="font-semibold text-navy underline" href={a.url} target="_blank" rel="noopener">{a.nombre}</a> <span className="text-slate-400">· {a.fecha}</span></li>))}</ul>
+        : <p className="mt-1 text-xs text-slate-400">Sin archivo cargado.</p>}
+    </div>);
+  };
+  return (<div className="fixed inset-0 z-50 flex justify-end" style={{background:"rgba(5,15,30,.55)"}} onClick={onClose}>
+    <div className="h-full w-full sm:max-w-2xl overflow-y-auto bg-white shadow-2xl" onClick={e=>e.stopPropagation()}>
+      <div className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b-4 border-lime bg-navy px-5 py-3.5" style={{paddingTop:"calc(14px + env(safe-area-inset-top,0px))"}}>
+        <div className="min-w-0"><h2 className="font-display text-xl text-white leading-tight truncate">{r.cliente}</h2>
+          <p className="text-[12px] truncate" style={{color:"#B9C8DC"}}>Dictamen legal · {r.empresa||"—"}</p></div>
+        <button onClick={onClose} aria-label="Cerrar" className="grid h-9 w-9 shrink-0 place-items-center rounded border border-navy-edge text-white hover:bg-navy-2"><Icon name="x" size={18}/></button>
+      </div>
+
+      <div className="p-5 space-y-4">
+        {enDictamen(r) && <div className={`rounded-lg border border-l-[6px] px-4 py-2 text-sm font-semibold ${vencido?"border-red-500 bg-red-50 text-red-700":"border-lime bg-lime-soft text-navy"}`}>
+          {dias==null?"Expediente recibido para dictamen":`Día ${dias} de ${PLAZO_DICTAMEN} para dictaminar${vencido?" · vencido":""}`}</div>}
+
+        <div className="rounded-lg border border-stone-200 p-3">
+          <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 mb-2">Datos del cliente</h3>
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+            <div><dt className="text-xs text-slate-500">Cliente</dt><dd className="font-semibold">{r.cliente}</dd></div>
+            <div><dt className="text-xs text-slate-500">Tipo de persona</dt><dd className="font-semibold">{r.tipoPersona||"—"}</dd></div>
+            <div><dt className="text-xs text-slate-500">Empresa</dt><dd>{r.empresa||"—"}</dd></div>
+            <div><dt className="text-xs text-slate-500">Ejecutivo</dt><dd>{r.ejecutivo||"—"}</dd></div>
+            <div><dt className="text-xs text-slate-500">Folio de venta</dt><dd className="mono">{r.folioVenta||"—"}</dd></div>
+            <div><dt className="text-xs text-slate-500">Tipo de venta</dt><dd>{r.tipoVenta||"—"}{r.plazo?` · ${r.plazo} meses`:""}</dd></div>
+            <div className="col-span-2"><dt className="text-xs text-slate-500">Equipos</dt><dd>{equiposTxt(r)||"—"}</dd></div>
+            {r.tipoContrato && <div className="col-span-2"><dt className="text-xs text-slate-500">Tipo de contrato</dt><dd>{r.tipoContrato}</dd></div>}
+          </dl>
+        </div>
+
+        <div>
+          <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 mb-2">Documentos legales</h3>
+          <div className="space-y-2">{DOCS_LEGALES.map(k=><Doc key={k} k={k}/>)}</div>
+        </div>
+
+        <div>
+          <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 mb-2">Tu dictamen</h3>
+          <Doc k={DOC_DICTAMEN} destacado/>
+          <textarea rows={3} value={nota} onChange={e=>setNota(e.target.value)} placeholder="Resumen o conclusión del dictamen (opcional)…" className="mt-2 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm outline-none focus:border-navy focus:ring-2 focus:ring-lime-soft"/>
+        </div>
+
+        {err && <p className="rounded-lg border border-l-[6px] border-red-500 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700">{err}</p>}
+        {msg && <p className="rounded-lg border border-l-[6px] border-lime bg-lime-soft px-3 py-2 text-xs font-semibold text-navy">{msg}</p>}
+      </div>
+
+      <div className="sticky bottom-0 flex flex-wrap items-center justify-end gap-2 border-t border-stone-200 bg-white px-5 py-3" style={{paddingBottom:"calc(12px + env(safe-area-inset-bottom,0px))"}}>
+        {!tieneDictamen && <span className="mr-auto text-xs text-slate-400">Sube el archivo del dictamen para poder enviarlo.</span>}
+        <button onClick={onClose} className="rounded-lg px-3.5 py-2 text-sm font-semibold text-slate-600 hover:bg-stone-100">Cerrar</button>
+        <button onClick={dictaminar} disabled={ocupado||!tieneDictamen} className="rounded-lg border border-lime bg-lime px-5 py-2 text-sm font-bold text-lime-dark hover:brightness-95 disabled:opacity-40">{ocupado?"Enviando…":"Enviar a Servicio a Clientes"}</button>
+      </div>
     </div>
   </div>);
 }
@@ -888,7 +989,7 @@ function BloqueDictamen({r, expedienteCompleto, onCambio}){
         <button onClick={()=>accion(()=>apiEnviarContratos(r.id),"Enviado a Contratos.")} disabled={ocupado}
           className="rounded-lg border border-lime bg-lime px-4 py-2 text-sm font-bold text-lime-dark hover:brightness-95 disabled:opacity-40">{ocupado?"Enviando…":"Enviar a Contratos"}</button>}
       {moral && !enDictamen(r) && !yaDictaminado(r) && !expedienteCompleto &&
-        <span className="self-center text-xs text-slate-400">Faltan documentos del expediente.</span>}
+        <span className="self-center text-xs text-slate-400">Faltan documentos del expediente (sin contar contrato firmado, contrato en físico y videos de firma, que se recaban después).</span>}
     </div>}
 
     {msg && <p className="mt-2 rounded-lg border border-l-[6px] border-lime bg-lime-soft px-3 py-2 text-xs font-semibold text-navy">{msg}</p>}
