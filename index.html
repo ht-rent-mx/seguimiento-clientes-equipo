@@ -399,6 +399,345 @@ function VentasEntregas({registros,fEjec,ejecutivos}){
   </div>);
 }
 
+/* ============================================================
+   PANEL DE CARTERA — comportamiento de la cartera de clientes
+   Embudo, etapas donde se detienen, por ejecutivo comercial,
+   por tipo de equipo y otros cortes. Todo se calcula en el
+   navegador con los mismos registros de la app + el historial
+   de etapas (sc_etapas_historial_u, solo lectura).
+   ============================================================ */
+const FUNNEL_PASOS=["Presentación","Documentación y dictamen","Asignación y contrato","Contrato enviado","Contrato recibido","Equipo listo","Programación de entrega","Pendiente de entrega","Entregado (parcial o total)"];
+const PASO_DE={"Presentación con Cliente":0,"Documentando":1,"En Dictamen":1,"Dictaminado":1,"Asignación y Contrato":2,"Contrato enviado":3,"Contrato recibido":4,"Equipo listo":5,"Programación entrega":6,"Pend. entrega Fábrica":7,"Pend. entrega Cliente":7,"Entregado":8};
+const ETAPAS_ABIERTAS=ESTATUS.filter(e=>!CERRADOS.includes(e));
+const EQUIPO_FAMILIAS=[[/dolly/i,"Dolly"],[/cama\s*baja/i,"Cama baja"],[/caja/i,"Caja seca"],[/porta|burrita/i,"Portacontenedor / isotanque"],[/plataforma/i,"Plataforma"],[/volteo|g[oó]ndola/i,"Volteo / góndola"],[/tolva|granelera|tanque/i,"Tolva / granelera / tanque"],[/chatarrera|jaula/i,"Chatarrera / jaula"],[/encortinado/i,"Encortinado"]];
+const DIA_MS=86400000;
+const fT=s=>{if(!s)return null;const t=String(s);const d=new Date(t.length<=10?t+"T00:00:00":t);return isNaN(d.getTime())?null:d;};
+const difD=(a,b)=>(b-a)/DIA_MS;
+const prom=a=>a.length?a.reduce((s,x)=>s+x,0)/a.length:null;
+const mediana=a=>{if(!a.length)return null;const s=a.slice().sort((x,y)=>x-y);const m=s.length>>1;return s.length%2?s[m]:(s[m-1]+s[m])/2;};
+const pctTxt=(a,b)=>b?((a/b)>=0.1||a===0?Math.round(a/b*100):Math.round(a/b*1000)/10)+"%":"–";
+const dTxt=x=>(x==null||isNaN(x))?"–":(x>=10?Math.round(x):Math.round(x*10)/10)+" d";
+function familiaEquipo(t){const s=String(t||"");for(const [re,n] of EQUIPO_FAMILIAS)if(re.test(s))return n;return "Otros";}
+function equipoPrincipal(r){const eqs=(r.equipos||[]).filter(e=>e&&e.tipo);if(!eqs.length)return null;return eqs.slice().sort((a,b)=>(Number(b.cantidad)||0)-(Number(a.cantidad)||0))[0];}
+function ejecDe(r){return String(r.ejecutivo||"").trim()||"(sin ejecutivo)";}
+function inicioGestion(r){const a=fT(r.creado);const p=primeraInter(r);const b=p?fT(p.fecha):null;if(a&&b)return b<a?b:a;return a||b;}
+function diasAltaEntrega(r){const a=inicioGestion(r),b=fT(fechaEntrega(r));if(!a||!b)return null;const d=difD(a,b);return d>=0?d:null;}
+function ultimoContacto(r){const b=(r.bitacora||[]).map(x=>fT(x.fecha)).filter(Boolean);if(b.length)return new Date(Math.max(...b.map(x=>x.getTime())));return fT(r.creado);}
+function esAbierto(r){const s=seccDe(r);return s==="activos"||s==="devueltos";}
+function etapaAbierta(r){return CERRADOS.includes(r.estatus)?"Entrega parcial":r.estatus;}
+function lineaEtapas(rows){
+  const tl=[];
+  rows.forEach(x=>{
+    const es=Array.isArray(x.e)?x.e.filter(s=>ESTATUS.includes(s)):[];
+    if(!es.length)return;
+    const est=principal(es);
+    if(!tl.length||tl[tl.length-1].est!==est)tl.push({est,desde:new Date(x.f),izqCens:tl.length===0&&x.a!=="alta"});
+  });
+  return tl;
+}
+function pasoAlcanzado(r,tl){
+  if(seccDe(r)==="entregados")return 8;
+  let m=-1;
+  (r.estatuses||[]).forEach(e=>{if(PASO_DE[e]!=null)m=Math.max(m,PASO_DE[e]);});
+  (tl||[]).forEach(x=>{if(PASO_DE[x.est]!=null)m=Math.max(m,PASO_DE[x.est]);});
+  return Math.max(m,0);
+}
+function resumenGrupo(lista,now){
+  const hoy=new Date(now);
+  const g={n:lista.length,ent:0,can:0,dev:0,act:0,uni:0,uniEnt:0,diasEnt:[],ant:[],sinC:0,compV:0,docs:0,entV:0,porEtapa:{}};
+  lista.forEach(r=>{
+    const s=seccDe(r);
+    if(s==="entregados")g.ent++;else if(s==="cancelados")g.can++;else if(s==="devueltos")g.dev++;else g.act++;
+    g.uni+=unidades(r);g.uniEnt+=equiposEntregados(r);
+    if(s==="entregados"){const d=diasAltaEntrega(r);if(d!=null)g.diasEnt.push(d);}
+    if(s==="activos"||s==="devueltos"){
+      const ini=inicioGestion(r);if(ini)g.ant.push(difD(ini,hoy));
+      const uc=ultimoContacto(r);if(uc&&difD(uc,hoy)>=7)g.sinC++;
+      if(estadoCompromiso(r,now)==="vencido")g.compV++;
+      if(!listoParaDictamen(r))g.docs++;
+      if(r.entregaProgramada&&r.entregaProgramada<HOY)g.entV++;
+      const et=etapaAbierta(r);g.porEtapa[et]=(g.porEtapa[et]||0)+1;
+    }
+  });
+  g.abiertos=g.act+g.dev;
+  g.etapaTop=Object.keys(g.porEtapa).sort((a,b)=>g.porEtapa[b]-g.porEtapa[a])[0]||null;
+  return g;
+}
+function agrupar(lista,keyFn,now){
+  const m={};lista.forEach(r=>{const k=keyFn(r);(m[k]=m[k]||[]).push(r);});
+  return Object.keys(m).map(k=>({k,g:resumenGrupo(m[k],now)})).sort((a,b)=>{const sa=/^(Sin |\()/.test(a.k),sb=/^(Sin |\()/.test(b.k);if(sa!==sb)return sa?1:-1;return b.g.n-a.g.n||a.k.localeCompare(b.k);});
+}
+const CORTES_EXTRA={
+  "Tipo de venta":r=>r.tipoVenta||"Sin dato",
+  "Empresa":r=>r.empresa||"Sin dato",
+  "Tipo de cliente":r=>r.tipoCliente||"Sin dato",
+  "Persona física / moral":r=>r.tipoPersona||"Sin dato",
+  "Marca del equipo":r=>{const e=equipoPrincipal(r);return e&&e.marca?e.marca:"Sin dato";},
+  "Condición del equipo":r=>{const e=equipoPrincipal(r);return e&&e.condicion?condLabel(e.marca,e.condicion):"Sin dato";},
+  "Patio de entrega":r=>r.patioEntrega||"Sin dato",
+  "Tipo de contrato":r=>r.tipoContrato||"Sin dato",
+  "Plazo":r=>r.plazo?r.plazo+" meses":"Sin plazo"
+};
+function BarraCiclo({g,alto}){
+  const t=g.n||1;
+  const seg=[["Entregados","bg-emerald-600",g.ent],["En proceso","bg-teal-400",g.act],["Devueltos a comercial","bg-orange-400",g.dev],["Cancelados","bg-rose-400",g.can]];
+  return <div className={`flex ${alto||"h-3"} w-full overflow-hidden rounded bg-stone-100`}>{seg.map(([k,c,v])=>v>0?<div key={k} className={c} style={{width:`${v/t*100}%`}} title={`${k}: ${v}`}></div>:null)}</div>;
+}
+function LeyendaCiclo(){
+  return <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">{[["bg-emerald-600","Entregados"],["bg-teal-400","En proceso"],["bg-orange-400","Devueltos a comercial"],["bg-rose-400","Cancelados"]].map(([c,t])=><span key={t} className="inline-flex items-center gap-1.5"><span className={`inline-block h-2.5 w-2.5 rounded-sm ${c}`}></span>{t}</span>)}</div>;
+}
+function CeldaPct({a,b,tono}){return <td className="px-3 py-2 text-right"><span className={`mono font-semibold ${tono||"text-slate-700"}`}>{pctTxt(a,b)}</span><span className="ml-1 text-[11px] text-slate-400">({a})</span></td>;}
+function TablaSegmento({titulo,sub,filas,total,etiqueta,conUnidades}){
+  return (<div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+    <div className="p-4 pb-2"><h3 className="text-sm font-bold text-slate-700">{titulo}</h3>{sub&&<p className="text-xs text-slate-500">{sub}</p>}</div>
+    <div className="px-4 pb-2"><LeyendaCiclo/></div>
+    <div className="overflow-x-auto"><table className="w-full text-sm">
+      <thead className="bg-stone-50 text-left text-xs uppercase text-slate-500"><tr>
+        <th className="px-3 py-2">{etiqueta}</th><th className="px-3 py-2 text-right">Clientes</th>
+        <th className="px-3 py-2 min-w-[140px]">Avance de la cartera</th>
+        <th className="px-3 py-2 text-right">Entregados</th><th className="px-3 py-2 text-right">En proceso</th><th className="px-3 py-2 text-right">Devueltos</th><th className="px-3 py-2 text-right">Cancelados</th>
+        {conUnidades&&<th className="px-3 py-2 text-right">Unidades entregadas</th>}
+        <th className="px-3 py-2 text-right" title="Días promedio desde el inicio de la gestión hasta la entrega, solo clientes entregados">Días a entrega</th>
+        <th className="px-3 py-2 text-right" title="Días promedio desde el inicio de la gestión, solo clientes aún abiertos">Antigüedad abiertos</th>
+        <th className="px-3 py-2">Dónde se concentran</th>
+        <th className="px-3 py-2 text-right" title="Abiertos sin ningún contacto en bitácora en 7 días o más">Sin contacto 7d+</th>
+      </tr></thead>
+      <tbody className="divide-y divide-stone-100">
+        {filas.map(({k,g})=>(<tr key={k} className="hover:bg-stone-50 align-middle">
+          <td className="px-3 py-2 font-medium text-slate-800">{k}</td>
+          <td className="px-3 py-2 text-right mono">{g.n}</td>
+          <td className="px-3 py-2"><BarraCiclo g={g}/></td>
+          <CeldaPct a={g.ent} b={g.n} tono="text-emerald-700"/><CeldaPct a={g.abiertos-g.dev} b={g.n} tono="text-teal-700"/><CeldaPct a={g.dev} b={g.n} tono="text-orange-600"/><CeldaPct a={g.can} b={g.n} tono="text-rose-600"/>
+          {conUnidades&&<td className="px-3 py-2 text-right"><span className="mono font-semibold text-slate-700">{pctTxt(g.uniEnt,g.uni)}</span><span className="ml-1 text-[11px] text-slate-400">({g.uniEnt}/{g.uni})</span></td>}
+          <td className="px-3 py-2 text-right mono text-slate-700">{dTxt(prom(g.diasEnt))}</td>
+          <td className="px-3 py-2 text-right mono text-slate-700">{dTxt(prom(g.ant))}</td>
+          <td className="px-3 py-2 text-xs text-slate-600">{g.etapaTop?<span>{g.etapaTop} <span className="text-slate-400">({g.porEtapa[g.etapaTop]})</span></span>:"–"}</td>
+          <td className="px-3 py-2 text-right mono">{g.sinC>0?<span className="font-semibold text-red-600">{g.sinC}</span>:<span className="text-slate-300">0</span>}</td>
+        </tr>))}
+        {filas.length===0&&<tr><td colSpan={conUnidades?12:11} className="px-3 py-6 text-center text-slate-400">Sin datos en este periodo.</td></tr>}
+      </tbody>
+      {filas.length>0&&total&&<tfoot className="bg-stone-50 font-bold"><tr>
+        <td className="px-3 py-2">Total general</td><td className="px-3 py-2 text-right mono">{total.n}</td>
+        <td className="px-3 py-2"><BarraCiclo g={total}/></td>
+        <CeldaPct a={total.ent} b={total.n} tono="text-emerald-700"/><CeldaPct a={total.abiertos-total.dev} b={total.n} tono="text-teal-700"/><CeldaPct a={total.dev} b={total.n} tono="text-orange-600"/><CeldaPct a={total.can} b={total.n} tono="text-rose-600"/>
+        {conUnidades&&<td className="px-3 py-2 text-right"><span className="mono">{pctTxt(total.uniEnt,total.uni)}</span><span className="ml-1 text-[11px] text-slate-400 font-normal">({total.uniEnt}/{total.uni})</span></td>}
+        <td className="px-3 py-2 text-right mono">{dTxt(prom(total.diasEnt))}</td><td className="px-3 py-2 text-right mono">{dTxt(prom(total.ant))}</td>
+        <td className="px-3 py-2 text-xs font-normal text-slate-600">{total.etapaTop||"–"}</td><td className="px-3 py-2 text-right mono">{total.sinC}</td>
+      </tr></tfoot>}
+    </table></div>
+  </div>);
+}
+function SelPanel({v,set,opts,pre}){return <label className="inline-flex items-center gap-1.5 rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-sm"><span className="text-xs text-slate-500">{pre}</span><select value={v} onChange={e=>set(e.target.value)} className="outline-none bg-transparent font-medium">{opts.map(o=>Array.isArray(o)?<option key={o[0]} value={o[0]}>{o[1]}</option>:<option key={o}>{o}</option>)}</select></label>;}
+function PanelCartera({registros,now}){
+  const [periodo,setPeriodo]=useState("todo");
+  const [empresa,setEmpresa]=useState("Todas");
+  const [corte,setCorte]=useState("Tipo de venta");
+  const [hist,setHist]=useState(null);
+  useEffect(()=>{let vivo=true;(async()=>{try{const d=USUARIO?await sbRpcU("sc_etapas_historial_u",{},2):await sbRpc("sc_etapas_historial",{p_pass:SESION_PASS},2);if(vivo)setHist({rows:Array.isArray(d)?d:[],ok:true});}catch(e){if(vivo)setHist({rows:[],ok:false,err:e.message});}})();return()=>{vivo=false;};},[registros.length]);
+
+  const tls=useMemo(()=>{
+    const m=new Map();if(!hist||!hist.ok)return m;
+    const por={};hist.rows.forEach(x=>{(por[x.c]=por[x.c]||[]).push(x);});
+    Object.keys(por).forEach(k=>{por[k].sort((a,b)=>new Date(a.f)-new Date(b.f));m.set(Number(k),lineaEtapas(por[k]));});
+    return m;
+  },[hist]);
+  const logDesde=useMemo(()=>{if(!hist||!hist.ok||!hist.rows.length)return null;return new Date(Math.min(...hist.rows.map(x=>new Date(x.f).getTime())));},[hist]);
+
+  const empresas=useMemo(()=>["Todas",...[...new Set(registros.map(r=>r.empresa).filter(Boolean))].sort()],[registros]);
+  const base=useMemo(()=>registros.filter(r=>{
+    if(empresa!=="Todas"&&r.empresa!==empresa)return false;
+    if(periodo!=="todo"){const d=inicioGestion(r);if(!d||difD(d,new Date(now))>Number(periodo))return false;}
+    return true;
+  }),[registros,empresa,periodo,now]);
+
+  const total=useMemo(()=>resumenGrupo(base,now),[base,now]);
+  const porEjec=useMemo(()=>agrupar(base,ejecDe,now),[base,now]);
+  const porEquipo=useMemo(()=>agrupar(base,r=>{const e=equipoPrincipal(r);return e?familiaEquipo(e.tipo):"Sin equipo";},now),[base,now]);
+  const porCorte=useMemo(()=>agrupar(base,CORTES_EXTRA[corte],now),[base,corte,now]);
+  const porMes=useMemo(()=>{
+    const m={};base.forEach(r=>{const d=inicioGestion(r);if(!d)return;const k=d.getFullYear()+"-"+pad(d.getMonth()+1);(m[k]=m[k]||[]).push(r);});
+    return Object.keys(m).sort().map(k=>({k,g:resumenGrupo(m[k],now)}));
+  },[base,now]);
+
+  /* Embudo: cuántos clientes llegaron al menos a cada paso */
+  const embudo=useMemo(()=>{
+    const alc=FUNNEL_PASOS.map(()=>0);let cancSinEtapa=0;
+    base.forEach(r=>{const tl=tls.get(r.id);const p=pasoAlcanzado(r,tl);for(let i=0;i<=p;i++)alc[i]++;if(seccDe(r)==="cancelados"&&!tl&&!(r.estatuses||[]).some(e=>PASO_DE[e]!=null))cancSinEtapa++;});
+    return {alc,cancSinEtapa};
+  },[base,tls]);
+  const caidaMayor=useMemo(()=>{let best=null;for(let i=1;i<FUNNEL_PASOS.length;i++){const a=embudo.alc[i-1],b=embudo.alc[i];if(a>=5){const c=b/a;if(!best||c<best.c)best={i,c,a,b};}}return best;},[embudo]);
+
+  /* Etapas donde se detienen los clientes abiertos */
+  const velocidad=useMemo(()=>{
+    const por={};const ids=new Set(base.map(r=>r.id));
+    tls.forEach((tl,id)=>{if(!ids.has(id))return;for(let i=0;i<tl.length-1;i++){if(tl[i].izqCens)continue;if(tl[i+1].est==="Cancelado"||estIdx(tl[i+1].est)<estIdx(tl[i].est))continue;(por[tl[i].est]=por[tl[i].est]||[]).push(difD(tl[i].desde,tl[i+1].desde));}});
+    return por;
+  },[tls,base]);
+  const filasEtapa=useMemo(()=>{
+    const abiertos=base.filter(esAbierto);
+    return [...ETAPAS_ABIERTAS,"Entrega parcial"].map(et=>{
+      const L=abiertos.filter(r=>etapaAbierta(r)===et);if(!L.length)return null;
+      const g=resumenGrupo(L,now);const dEt=[];let verif=0;
+      L.forEach(r=>{const tl=tls.get(r.id);if(tl&&tl.length&&tl[tl.length-1].est===r.estatus){const last=tl[tl.length-1];dEt.push(difD(last.desde,new Date(now)));if(!(tl.length===1&&last.izqCens))verif++;}});
+      const vel=velocidad[et]||[];
+      return {et,n:L.length,g,antProm:prom(g.ant),dEtapa:prom(dEt),nEt:dEt.length,verif,velMed:mediana(vel),velN:vel.length};
+    }).filter(Boolean);
+  },[base,tls,velocidad,now]);
+  const nAbiertos=total.abiertos;
+  const maxEt=Math.max(1,...filasEtapa.map(f=>f.n));
+  const dEtMax=Math.max(0,...filasEtapa.filter(f=>f.n>=2&&f.dEtapa!=null).map(f=>f.dEtapa));
+
+  /* Ejecutivo × etapa (clientes abiertos) */
+  const matriz=useMemo(()=>{
+    const cols=filasEtapa.map(f=>f.et);
+    const filas=porEjec.map(({k})=>{const L=base.filter(r=>ejecDe(r)===k&&esAbierto(r));const c={};L.forEach(r=>{const e=etapaAbierta(r);c[e]=(c[e]||0)+1;});return {k,c,t:L.length};}).filter(f=>f.t>0);
+    return {cols,filas};
+  },[base,porEjec,filasEtapa]);
+
+  /* Lectura rápida */
+  const lectura=useMemo(()=>{
+    const L=[];const t=total;if(!t.n)return L;
+    L.push(<span>De <b>{t.n}</b> clientes, <b>{t.ent}</b> ({pctTxt(t.ent,t.n)}) ya se entregaron, <b>{t.abiertos}</b> ({pctTxt(t.abiertos,t.n)}) siguen en proceso{t.dev>0?<span> (de ellos {t.dev} devueltos a comercial)</span>:null} y <b>{t.can}</b> ({pctTxt(t.can,t.n)}) se cancelaron.</span>);
+    if(t.diasEnt.length>=3)L.push(<span>Los clientes que llegaron a entrega tardaron en promedio <b>{dTxt(prom(t.diasEnt))}</b> desde que inició su gestión (mitad de ellos en {dTxt(mediana(t.diasEnt))} o menos).</span>);
+    if(caidaMayor)L.push(<span>El paso donde menos clientes han avanzado es de «{FUNNEL_PASOS[caidaMayor.i-1]}» a «{FUNNEL_PASOS[caidaMayor.i]}»: solo <b>{Math.round(caidaMayor.c*100)}%</b> de quienes llegaron a la primera ya pasaron a la segunda ({caidaMayor.b} de {caidaMayor.a}); el resto sigue ahí o se canceló.</span>);
+    if(filasEtapa.length){
+      const top=filasEtapa.slice().sort((a,b)=>b.n-a.n)[0];
+      L.push(<span>Hoy la etapa con más clientes detenidos es «{top.et}»: <b>{top.n}</b> ({pctTxt(top.n,nAbiertos)} de los abiertos), con {dTxt(top.antProm)} promedio desde su inicio.</span>);
+      const lento=filasEtapa.filter(f=>f.n>=2&&f.dEtapa!=null).sort((a,b)=>b.dEtapa-a.dEtapa)[0];
+      if(lento&&lento.et!==top.et)L.push(<span>Donde más tiempo llevan sin cambiar de etapa es «{lento.et}»: {dTxt(lento.dEtapa)} en promedio.</span>);
+    }
+    const vel=Object.keys(velocidad).filter(k=>velocidad[k].length>=3).sort((a,b)=>mediana(velocidad[b])-mediana(velocidad[a]))[0];
+    if(vel&&logDesde)L.push(<span>Con los cambios de etapa registrados desde el {corto(toISO(logDesde))}, la etapa que más tarda en avanzar es «{vel}» (mediana {dTxt(mediana(velocidad[vel]))}, {velocidad[vel].length} casos).</span>);
+    const ej=porEjec.filter(x=>x.g.n>=5);
+    if(ej.length>=2){
+      const mejor=ej.slice().sort((x,y)=>y.g.ent/y.g.n-x.g.ent/x.g.n)[0],canc=ej.slice().sort((x,y)=>y.g.can/y.g.n-x.g.can/x.g.n)[0];
+      L.push(<span>Por ejecutivo (con 5+ clientes): <b>{mejor.k}</b> tiene la mayor proporción entregada ({pctTxt(mejor.g.ent,mejor.g.n)}){canc.g.can>0?<span> y <b>{canc.k}</b> la mayor cancelación ({pctTxt(canc.g.can,canc.g.n)})</span>:null}.</span>);
+    }
+    const eq=porEquipo.filter(x=>x.k!=="Sin equipo");
+    if(eq.length){
+      const mas=eq[0],eq5=eq.filter(x=>x.g.n>=5),canc=eq5.slice().sort((a,b)=>b.g.can/b.g.n-a.g.can/a.g.n)[0];
+      L.push(<span>Por tipo de equipo, <b>{mas.k}</b> concentra {mas.g.n} clientes ({pctTxt(mas.g.n,t.n)}){canc&&canc.g.can>0?<span>; la mayor cancelación está en <b>{canc.k}</b> ({pctTxt(canc.g.can,canc.g.n)})</span>:null}.</span>);
+    }
+    if(t.abiertos>0&&(t.sinC||t.compV||t.entV))L.push(<span>Alertas hoy: <b>{t.sinC}</b> clientes abiertos sin contacto en 7+ días, <b>{t.compV}</b> con llamada de compromiso vencida y <b>{t.entV}</b> con fecha de entrega ya vencida.</span>);
+    return L;
+  },[total,caidaMayor,filasEtapa,velocidad,logDesde,porEjec,porEquipo,nAbiertos]);
+
+  const cargaInicial=useMemo(()=>{const m={};registros.forEach(r=>{if(r.creado)m[r.creado]=(m[r.creado]||0)+1;});const k=Object.keys(m).sort((a,b)=>m[b]-m[a])[0];return k&&registros.length>=20&&m[k]/registros.length>=0.15?{fecha:k,n:m[k]}:null;},[registros]);
+  const nombreMes=k=>{const[a,m]=k.split("-").map(Number);return MESES_V[m-1]+" "+a;};
+
+  return (<div className="space-y-5">
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      <div><h2 className="text-lg font-bold text-slate-900">Panel de cartera</h2><p className="text-xs text-slate-500">Cómo se han movido los clientes: avance, retrasos y resultados · {base.length} cliente(s) en el análisis</p></div>
+      <div className="flex flex-wrap items-center gap-2">
+        <SelPanel v={periodo} set={setPeriodo} pre="Inicio de gestión" opts={[["todo","Todo"],["30","Últimos 30 días"],["60","Últimos 60 días"],["90","Últimos 90 días"],["180","Últimos 180 días"]]}/>
+        <SelPanel v={empresa} set={setEmpresa} pre="Empresa" opts={empresas}/>
+      </div>
+    </div>
+
+    {total.n===0?<div className="rounded-xl border border-stone-200 bg-white p-8 text-center text-slate-400">No hay clientes con estos filtros.</div>:<>
+
+    <div className="rounded-xl border border-navy/20 bg-white p-4">
+      <h3 className="text-sm font-bold text-navy mb-2">Lectura rápida</h3>
+      <ul className="space-y-1.5 text-sm text-slate-700 list-disc pl-5">{lectura.map((x,i)=><li key={i}>{x}</li>)}</ul>
+    </div>
+
+    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+      <Kpi icon="user" label="Clientes" valor={total.n} tono="text-slate-900"/>
+      <Kpi icon="check" label="Entregados" valor={pctTxt(total.ent,total.n)} tono="text-emerald-700"/>
+      <Kpi icon="clock" label="En proceso" valor={pctTxt(total.abiertos-total.dev,total.n)} tono="text-teal-600"/>
+      <Kpi icon="left" label="Devueltos a comercial" valor={pctTxt(total.dev,total.n)} tono="text-orange-600"/>
+      <Kpi icon="x" label="Cancelados" valor={pctTxt(total.can,total.n)} tono="text-rose-600"/>
+      <Kpi icon="calendar" label="Días a entrega (prom.)" valor={dTxt(prom(total.diasEnt))} tono="text-slate-900"/>
+    </div>
+    <div className="rounded-xl border border-stone-200 bg-white p-4 space-y-2"><BarraCiclo g={total} alto="h-5"/><LeyendaCiclo/></div>
+
+    <div className="rounded-xl border border-stone-200 bg-white p-4">
+      <h3 className="text-sm font-bold text-slate-700">Embudo: ¿hasta dónde llegan los clientes?</h3>
+      <p className="text-xs text-slate-500 mb-3">Cuántos clientes han llegado al menos a cada etapa (incluye a los que ya se entregaron o se cancelaron después de pasar por ella). Junto a cada barra: cuántos son y qué % del total; la flecha indica qué % de los que llegaron a la etapa anterior ya pasó a esta (los demás siguen ahí o se cancelaron).</p>
+      <div className="space-y-2">{FUNNEL_PASOS.map((nom,i)=>{
+        const n=embudo.alc[i],prev=i>0?embudo.alc[i-1]:null,conv=prev?n/prev:null;
+        const esCaida=caidaMayor&&caidaMayor.i===i;
+        return (<div key={nom}>
+          <div className="flex items-center gap-2">
+            <span className="w-44 shrink-0 text-xs font-semibold text-slate-600">{nom}</span>
+            <div className="flex-1 h-5 rounded bg-stone-100 overflow-hidden"><div className={`h-full ${i===8?"bg-emerald-600":"bg-teal-500"}`} style={{width:`${n/total.n*100}%`}}></div></div>
+            <span className="w-28 text-right mono text-xs font-semibold text-slate-700">{n} · {pctTxt(n,total.n)}</span>
+            <span className={`w-40 text-right text-[11px] ${esCaida?"font-bold text-red-600":"text-slate-400"}`}>{conv==null?"":`↳ ${Math.round(conv*100)}% ya pasó de la anterior`}</span>
+          </div>
+        </div>);
+      })}</div>
+      {embudo.cancSinEtapa>0&&<p className="mt-2 text-[11px] text-slate-400">{embudo.cancSinEtapa} cliente(s) cancelado(s) no tienen etapa previa registrada; se cuentan solo en «Presentación».</p>}
+      <p className="mt-1 text-[11px] text-slate-400">«Documentación y dictamen» agrupa Documentando, En Dictamen y Dictaminado (el dictamen aplica solo a persona moral).</p>
+    </div>
+
+    <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+      <div className="p-4 pb-2"><h3 className="text-sm font-bold text-slate-700">¿Dónde se detienen los clientes abiertos?</h3><p className="text-xs text-slate-500">{nAbiertos} cliente(s) abiertos hoy, por etapa actual. En rojo, la etapa donde llevan más tiempo sin cambiar.</p></div>
+      <div className="overflow-x-auto"><table className="w-full text-sm">
+        <thead className="bg-stone-50 text-left text-xs uppercase text-slate-500"><tr>
+          <th className="px-3 py-2">Etapa actual</th><th className="px-3 py-2 min-w-[160px]">Clientes abiertos</th>
+          <th className="px-3 py-2 text-right" title="Días promedio desde el inicio de la gestión">Antigüedad</th>
+          <th className="px-3 py-2 text-right" title="Días promedio que llevan en la etapa actual, según el historial de cambios">Días en la etapa</th>
+          <th className="px-3 py-2 text-right" title="Mediana de días que tardaron los clientes que ya salieron de esta etapa hacia una posterior">Tarda en avanzar</th>
+          <th className="px-3 py-2 text-right">Sin contacto 7d+</th><th className="px-3 py-2 text-right">Compromiso vencido</th><th className="px-3 py-2 text-right">Docs. pendientes</th><th className="px-3 py-2 text-right">Entrega vencida</th>
+        </tr></thead>
+        <tbody className="divide-y divide-stone-100">{filasEtapa.map(f=>{
+          const peor=f.n>=2&&f.dEtapa!=null&&dEtMax>0&&f.dEtapa===dEtMax;
+          const c=ESTATUS_COLOR[f.et];
+          return (<tr key={f.et} className="hover:bg-stone-50">
+            <td className="px-3 py-2"><span className={`inline-block rounded border px-2 py-0.5 text-xs font-semibold ${c?c.chip:"bg-amber-50 text-amber-800 border-amber-200"}`}>{f.et}</span></td>
+            <td className="px-3 py-2"><div className="flex items-center gap-2"><div className="flex-1 h-3 rounded bg-stone-100 overflow-hidden"><div className="h-full bg-slate-500" style={{width:`${f.n/maxEt*100}%`}}></div></div><span className="w-20 text-right mono text-xs font-semibold text-slate-700">{f.n} · {pctTxt(f.n,nAbiertos)}</span></div></td>
+            <td className="px-3 py-2 text-right mono">{dTxt(f.antProm)}</td>
+            <td className={`px-3 py-2 text-right mono ${peor?"font-bold text-red-600":""}`}>{dTxt(f.dEtapa)}{f.nEt>0&&f.verif<f.nEt&&<span className="ml-1 text-[10px] font-normal text-slate-400" title="En algunos clientes la fecha exacta de entrada a la etapa es anterior al historial; el dato es un mínimo.">≥</span>}</td>
+            <td className="px-3 py-2 text-right mono">{f.velMed==null?<span className="text-slate-300">–</span>:<span>{dTxt(f.velMed)} <span className="text-[10px] text-slate-400">({f.velN})</span></span>}</td>
+            <td className="px-3 py-2 text-right mono">{f.g.sinC>0?<span className="font-semibold text-red-600">{f.g.sinC}</span>:<span className="text-slate-300">0</span>}</td>
+            <td className="px-3 py-2 text-right mono">{f.g.compV>0?<span className="font-semibold text-red-600">{f.g.compV}</span>:<span className="text-slate-300">0</span>}</td>
+            <td className="px-3 py-2 text-right mono">{f.g.docs>0?<span className="font-semibold text-indigo-600">{f.g.docs}</span>:<span className="text-slate-300">0</span>}</td>
+            <td className="px-3 py-2 text-right mono">{f.g.entV>0?<span className="font-semibold text-red-600">{f.g.entV}</span>:<span className="text-slate-300">0</span>}</td>
+          </tr>);})}
+          {filasEtapa.length===0&&<tr><td colSpan={9} className="px-3 py-6 text-center text-slate-400">No hay clientes abiertos.</td></tr>}
+        </tbody>
+      </table></div>
+      <p className="px-4 py-2 text-[11px] text-slate-400">{hist&&!hist.ok?`No se pudo leer el historial de etapas (${hist.err}); «Días en la etapa» y «Tarda en avanzar» no están disponibles.`:logDesde?`El historial de cambios de etapa existe desde el ${corto(toISO(logDesde))}; antes de esa fecha no se guardó cuándo cambió cada cliente de etapa. «≥» marca promedios con datos anteriores al historial (el tiempo real es igual o mayor). «Tarda en avanzar» solo usa cambios completos observados (el número entre paréntesis es cuántos).`:"Cargando historial de etapas…"} «Docs. pendientes» = faltan documentos previos al contrato.</p>
+    </div>
+
+    <TablaSegmento titulo="Por ejecutivo comercial" sub="Cómo va la cartera de cada ejecutivo; el % es sobre sus clientes." filas={porEjec} total={total} etiqueta="Ejecutivo comercial"/>
+
+    {matriz.filas.length>0&&<div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+      <div className="p-4 pb-2"><h3 className="text-sm font-bold text-slate-700">Ejecutivo × etapa actual</h3><p className="text-xs text-slate-500">Dónde está hoy la cartera abierta de cada ejecutivo. Más oscuro = mayor parte de sus clientes abiertos.</p></div>
+      <div className="overflow-x-auto"><table className="w-full text-xs">
+        <thead className="bg-stone-50 text-left uppercase text-slate-500"><tr><th className="px-3 py-2">Ejecutivo</th>{matriz.cols.map(c=><th key={c} className="px-2 py-2 text-center font-semibold">{c}</th>)}<th className="px-3 py-2 text-right">Abiertos</th></tr></thead>
+        <tbody className="divide-y divide-stone-100">{matriz.filas.map(f=>(<tr key={f.k}>
+          <td className="px-3 py-2 font-medium text-slate-800 whitespace-nowrap">{f.k}</td>
+          {matriz.cols.map(c=>{const v=f.c[c]||0;const sh=f.t?v/f.t:0;return <td key={c} className="px-2 py-2 text-center mono" style={{background:v?`rgba(11,61,102,${0.08+sh*0.55})`:"transparent",color:sh>0.45?"#fff":"#15203B"}}>{v||""}</td>;})}
+          <td className="px-3 py-2 text-right mono font-semibold">{f.t}</td>
+        </tr>))}</tbody>
+      </table></div>
+    </div>}
+
+    <TablaSegmento titulo="Por tipo de equipo" sub="Cada cliente se agrupa por el equipo principal de su pedido (el de mayor cantidad). «Unidades entregadas» sí cuenta todas las unidades." filas={porEquipo} total={total} etiqueta="Tipo de equipo" conUnidades/>
+
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2"><h3 className="text-sm font-bold text-slate-700">Otros cortes</h3><SelPanel v={corte} set={setCorte} pre="Ver por" opts={Object.keys(CORTES_EXTRA)}/></div>
+      <TablaSegmento titulo={"Por "+corte.toLowerCase()} filas={porCorte} total={total} etiqueta={corte}/>
+    </div>
+
+    <div className="rounded-xl border border-stone-200 bg-white p-4">
+      <h3 className="text-sm font-bold text-slate-700">Por mes de inicio de gestión</h3>
+      <p className="text-xs text-slate-500 mb-3">De los clientes que entraron cada mes, ¿cuántos ya se entregaron, siguen abiertos o se cancelaron?</p>
+      <div className="space-y-2.5">{porMes.map(({k,g})=>(<div key={k} className="flex items-center gap-2">
+        <span className="w-32 shrink-0 text-xs font-semibold text-slate-600">{nombreMes(k)}</span>
+        <div className="flex-1"><BarraCiclo g={g} alto="h-4"/></div>
+        <span className="w-12 text-right mono text-xs text-slate-500">{g.n}</span>
+        <span className="w-44 text-right text-[11px] text-slate-500"><span className="text-emerald-700 font-semibold">{pctTxt(g.ent,g.n)}</span> entr. · <span className="text-teal-700 font-semibold">{pctTxt(g.abiertos,g.n)}</span> abiertos · <span className="text-rose-600 font-semibold">{pctTxt(g.can,g.n)}</span> canc.</span>
+      </div>))}</div>
+      {cargaInicial&&<p className="mt-3 text-[11px] text-slate-400">{cargaInicial.n} clientes tienen fecha de alta {cargaInicial.fecha} (carga inicial de la app); para ellos el inicio de gestión se toma de su primer contacto en bitácora cuando es anterior.</p>}
+    </div>
+
+    <p className="text-[11px] text-slate-400">«Inicio de gestión» = la más antigua entre la fecha de alta y el primer contacto en bitácora. «Días a entrega» usa la fecha de entrega registrada en la ficha. «Devueltos a comercial» son clientes regresados al ejecutivo para completar información; cuentan como abiertos en el embudo y en la tabla de etapas.</p>
+    </>}
+  </div>);
+}
+
 function interpretarCli(texto, ctx){
   const t=" "+_norm(texto)+" ";
   const res={busca:[]}; const hits=[];
@@ -572,7 +911,7 @@ function App(){
         <TableroEtapas counts={etapaCounts} total={porEjec.length} activo={fEstatus} onPick={est=>{setFEstatus(fEstatus===est?"":est);setVista("clientes");}}/>
 
         <div className="flex items-center justify-between gap-3 flex-wrap mb-4">
-          <div className="flex flex-wrap gap-1 border-b-[3px] border-navy"><Tab activo={vista==="clientes"} onClick={()=>setVista("clientes")}>Clientes</Tab><Tab activo={vista==="tablero"} onClick={()=>setVista("tablero")}>Tablero</Tab><Tab activo={vista==="lista"} onClick={()=>setVista("lista")}>Lista</Tab><Tab activo={vista==="dia"} onClick={()=>setVista("dia")}>Día</Tab><Tab activo={vista==="ventas"} onClick={()=>setVista("ventas")}>Ventas y Entregas</Tab></div>
+          <div className="flex flex-wrap gap-1 border-b-[3px] border-navy"><Tab activo={vista==="clientes"} onClick={()=>setVista("clientes")}>Clientes</Tab><Tab activo={vista==="tablero"} onClick={()=>setVista("tablero")}>Tablero</Tab><Tab activo={vista==="lista"} onClick={()=>setVista("lista")}>Lista</Tab><Tab activo={vista==="dia"} onClick={()=>setVista("dia")}>Día</Tab><Tab activo={vista==="ventas"} onClick={()=>setVista("ventas")}>Ventas y Entregas</Tab>{!ES_LEGAL()&&<Tab activo={vista==="panel"} onClick={()=>setVista("panel")}>Panel de cartera</Tab>}</div>
           <div className="flex items-center gap-2 flex-wrap">
             <div className="flex items-center gap-1.5 rounded-lg border border-stone-300 bg-white px-2.5"><Icon name="search" size={14} className="text-slate-400"/><input value={busca} onChange={e=>setBusca(e.target.value)} placeholder="Buscar cliente, NIV, folio, tel…" className="py-1.5 text-sm outline-none w-48"/></div>
             <Select value={fEjec} onChange={cambiarEjec} options={["Todos",...ejecutivos]} prefijo="Ejecutivo"/>
@@ -583,6 +922,7 @@ function App(){
 
         {fEstatus && <div className="mb-3"><span className="inline-flex items-center gap-2 rounded-lg bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700">Etapa: {fEstatus} <button onClick={()=>setFEstatus("")} className="text-slate-500 hover:text-red-500"><Icon name="x" size={13}/></button></span></div>}
         {vista==="ventas" && <VentasEntregas registros={registros} fEjec={fEjec} ejecutivos={ejecutivos}/>}
+        {vista==="panel" && !ES_LEGAL() && <PanelCartera registros={registros} now={now}/>}
         {vista==="clientes" && (()=>{
           const cActivos=mostrados.filter(r=>seccDe(r)==="activos").length;
           const cEntreg=mostrados.filter(r=>seccDe(r)==="entregados").length;
