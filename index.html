@@ -73,7 +73,8 @@ let USUARIO = null; // {nombre, correo, nivel} cuando se entra con usuario de Pl
 async function sbRpcU(fn,args,reintentos){reintentos=reintentos||3;let ultimo;for(let i=0;i<reintentos;i++){try{const {data,error}=await sb.rpc(fn,args||{});if(error){const m=error.message||"error";if(/acceso/i.test(m))throw new Error("ACCESO: tu usuario no tiene permiso para esta acción.");throw new Error(m);}return data;}catch(e){ultimo=e;if(String(e.message).startsWith("ACCESO"))break;if(i<reintentos-1)await new Promise(res=>setTimeout(res,800*(i+1)));}}throw ultimo;}
 async function apiMiAcceso(){return await sbRpcU("sc_mi_acceso",{},2);}
 async function apiHistorial(id){return await sbRpcU("sc_historial_u",{p_cliente:id},2);}
-async function apiEnviarLegal(id){return await sbRpcU("sc_enviar_legal",{p_cliente:id},1);}
+async function apiEnviarLegal(id,para){return await sbRpcU("sc_enviar_legal",{p_cliente:id,p_para:para||null},1);}
+const ABOGADOS=[{correo:"ivan.castillo@htrent.mx",nombre:"Iván Castillo",puesto:"Gerente Legal"},{correo:"jchernandez79@gmail.com",nombre:"Juan Carlos Hernández",puesto:"Abogado"},{correo:"ambos",nombre:"Ambos",puesto:"Iván y Juan Carlos"}];
 async function apiDictaminado(id,nota){return await sbRpcU("sc_marcar_dictaminado",{p_cliente:id,p_nota:nota||null},1);}
 async function apiEnviarContratos(id){return await sbRpcU("sc_enviar_contratos",{p_cliente:id},1);}
 const ES_LEGAL=()=>!!(USUARIO&&USUARIO.legal);
@@ -1292,7 +1293,10 @@ function FichaLegal({r, onClose, onCambio}){
 function BloqueDictamen({r, expedienteCompleto, onCambio}){
   const [msg,setMsg]=useState("");const [err,setErr]=useState("");const [ocupado,setOcupado]=useState(false);
   const [nota,setNota]=useState("");
+  const [abogado,setAbogado]=useState("");
   const legal=ES_LEGAL();
+  const ab=r.abogadoDictamen||null;
+  const abTxt=ab&&Array.isArray(ab.nombres)&&ab.nombres.length?ab.nombres.join(" y "):"el área legal";
   const moral=(r.tipoPersona||"")==="Persona moral";
   const dict=r.dictamenLegal||null;
   const dias=diasDesde(r.enviadoLegal);
@@ -1311,7 +1315,7 @@ function BloqueDictamen({r, expedienteCompleto, onCambio}){
     </div>
 
     {yaDictaminado(r) ? <p className="text-sm">Dictaminado{dict?` por ${dict.por||"—"} · ${String(dict.fecha||"").replace("T"," ")}`:""}.{dict&&dict.nota?<span className="block text-slate-600">{dict.nota}</span>:null}</p>
-     : enDictamen(r) ? <p className="text-sm text-slate-600">El expediente está con el área legal{r.enviadoLegal?` desde el ${String(r.enviadoLegal).slice(0,10)}`:""}.</p>
+     : enDictamen(r) ? <p className="text-sm text-slate-600">El expediente está con {abTxt}{r.enviadoLegal?` desde el ${String(r.enviadoLegal).slice(0,10)}`:""}.</p>
      : <p className="text-sm text-slate-600">Cliente persona moral: antes de contratos, el expediente pasa por dictamen legal.</p>}
 
     {legal && enDictamen(r) && <div className="mt-3 space-y-2">
@@ -1320,10 +1324,20 @@ function BloqueDictamen({r, expedienteCompleto, onCambio}){
       <button onClick={()=>accion(()=>apiDictaminado(r.id,nota.trim()),"Marcado como dictaminado.")} disabled={ocupado} className="rounded-lg border border-lime bg-lime px-4 py-2 text-sm font-bold text-lime-dark hover:brightness-95 disabled:opacity-40">{ocupado?"Guardando…":"Marcar como dictaminado"}</button>
     </div>}
 
+    {!legal && moral && !enDictamen(r) && !yaDictaminado(r) && <div className="mt-3">
+      <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500 mb-1">¿A quién se envía el dictamen?</p>
+      <div className="flex flex-wrap gap-2">
+        {ABOGADOS.map(a=><label key={a.correo} className={`cursor-pointer rounded-lg border px-3 py-2 text-sm ${abogado===a.correo?"border-navy bg-navy text-white":"border-stone-300 bg-white text-navy hover:border-navy"}`}>
+          <input type="radio" name={`abogado-${r.id}`} value={a.correo} checked={abogado===a.correo} onChange={()=>setAbogado(a.correo)} className="sr-only"/>
+          <span className="font-semibold">{a.nombre}</span><span className={`block text-[11px] ${abogado===a.correo?"text-white/80":"text-slate-500"}`}>{a.puesto}</span>
+        </label>)}
+      </div>
+    </div>}
+
     {!legal && <div className="mt-3 flex flex-wrap gap-2">
       {moral && !enDictamen(r) && !yaDictaminado(r) &&
-        <button onClick={()=>accion(()=>apiEnviarLegal(r.id),"Enviado al área legal.")} disabled={ocupado||!expedienteCompleto}
-          title={expedienteCompleto?"":"Primero completa el expediente"}
+        <button onClick={()=>{const a=ABOGADOS.find(x=>x.correo===abogado);accion(()=>apiEnviarLegal(r.id,abogado),`Enviado a dictamen: ${a?(a.correo==="ambos"?"Iván Castillo y Juan Carlos Hernández":a.nombre):""}.`);}} disabled={ocupado||!expedienteCompleto||!abogado}
+          title={!expedienteCompleto?"Primero completa el expediente":(!abogado?"Elige a qué abogado enviarlo":"")}
           className="rounded-lg border border-navy bg-navy px-4 py-2 text-sm font-semibold text-white hover:bg-navy-2 disabled:opacity-40">{ocupado?"Enviando…":"Enviar a dictamen legal"}</button>}
       {yaDictaminado(r) &&
         <button onClick={()=>accion(()=>apiEnviarContratos(r.id),"Enviado a Contratos.")} disabled={ocupado}
