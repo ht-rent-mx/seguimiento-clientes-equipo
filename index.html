@@ -1206,7 +1206,7 @@ function Modal({inicial,fEjec,ejecutivos,cliPorEjec,onClose,onSave,puedeEditar,o
         <Campo label="Patio de entrega"><select value={f.patioEntrega} onChange={e=>set("patioEntrega",e.target.value)} className={inp}><option value="">— Selecciona patio —</option>{PATIOS.map(p=><option key={p}>{p}</option>)}</select></Campo>
         <div className="grid grid-cols-2 gap-3"><Campo label="Entrega de fábrica o taller" hint="Cuándo llega el equipo"><input type="date" value={f.entregaFabrica} onChange={e=>set("entregaFabrica",e.target.value)} className={inp}/></Campo><Campo label="Fecha de entrega al cliente"><input type="date" value={f.entregaProgramada} onChange={e=>set("entregaProgramada",e.target.value)} className={inp}/></Campo></div>
         <Campo label="Notas (opcional)"><textarea value={f.notas} onChange={e=>set("notas",e.target.value)} rows={2} className={inp}/></Campo>
-        {inicial && inicial.id>0 && USUARIO && <BloqueDictamen r={{...inicial,requisitos:f.requisitos,tipoCliente:f.tipoCliente,tipoPersona:f.tipoPersona}} expedienteCompleto={listoParaDictamen({...inicial,requisitos:f.requisitos,tipoCliente:f.tipoCliente})} onCambio={onCambiado}/>}
+        {inicial && inicial.id>0 && USUARIO && <BloqueDictamen r={{...inicial,requisitos:f.requisitos,tipoCliente:f.tipoCliente,tipoPersona:f.tipoPersona,estatuses:f.estatuses,enviadoLegal:f.enviadoLegal,abogadoDictamen:f.abogadoDictamen,dictamenLegal:f.dictamenLegal}} expedienteCompleto={listoParaDictamen({...inicial,requisitos:f.requisitos,tipoCliente:f.tipoCliente})} onAplicar={patch=>setF(p=>{const es=Array.from(new Set([...(p.estatuses||[]),...(patch.agregar||[])]));return {...p,...(patch.campos||{}),estatuses:es,estatus:principal(es)};})} onCambio={onCambiado}/>}
         {inicial && inicial.id>0 && USUARIO && <HistorialCambios id={inicial.id}/>}
       </div>
       <div className="sticky bottom-0 flex justify-end gap-2 border-t border-stone-200 bg-white px-5 py-3"><button onClick={onClose} className="rounded-lg px-3.5 py-2 text-sm font-semibold text-slate-600 hover:bg-stone-100">Cancelar</button><button onClick={()=>valido&&guardarLimpio()} disabled={!valido||!puedeEditar} title={puedeEditar?"":"Modo consulta: no puedes guardar"} className="rounded-lg border border-lime bg-lime px-5 py-2 text-sm font-bold text-lime-dark hover:brightness-95 disabled:opacity-40">{inicial?"Guardar cambios":"Crear cliente"}</button></div>
@@ -1349,7 +1349,7 @@ function FichaLegal({r, onClose, onCambio}){
 }
 
 /* ---------- Dictamen legal (persona moral) ---------- */
-function BloqueDictamen({r, expedienteCompleto, onCambio}){
+function BloqueDictamen({r, expedienteCompleto, onCambio, onAplicar}){
   const [msg,setMsg]=useState("");const [err,setErr]=useState("");const [ocupado,setOcupado]=useState(false);
   const [nota,setNota]=useState("");
   const [abogado,setAbogado]=useState("");
@@ -1361,9 +1361,9 @@ function BloqueDictamen({r, expedienteCompleto, onCambio}){
   const dias=diasDesde(r.enviadoLegal);
   const vencido=enDictamen(r)&&dias!=null&&dias>PLAZO_DICTAMEN;
   if(!moral && !enDictamen(r) && !yaDictaminado(r)) return null;
-  async function accion(fn,txt){
+  async function accion(fn,txt,patch){
     if(ocupado)return; setOcupado(true); setErr(""); setMsg("");
-    try{ await fn(); setMsg(txt); onCambio&&onCambio(); }
+    try{ const res=await fn(); setMsg(txt); if(onAplicar&&patch)onAplicar(typeof patch==="function"?patch(res):patch); onCambio&&onCambio(); }
     catch(e){ setErr(e.message); } finally{ setOcupado(false); }
   }
   return (<div className="rounded-lg border border-stone-200 p-3">
@@ -1380,7 +1380,7 @@ function BloqueDictamen({r, expedienteCompleto, onCambio}){
     {legal && enDictamen(r) && <div className="mt-3 space-y-2">
       <textarea rows={3} value={nota} onChange={e=>setNota(e.target.value)} placeholder="Resumen del dictamen (opcional)…" className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm outline-none focus:border-navy focus:ring-2 focus:ring-lime-soft"/>
       <p className="text-[11px] text-slate-400">Sube el documento del dictamen en la lista de requisitos, con el botón 📎, antes de marcarlo.</p>
-      <button onClick={()=>accion(()=>apiDictaminado(r.id,nota.trim()),"Marcado como dictaminado.")} disabled={ocupado} className="rounded-lg border border-lime bg-lime px-4 py-2 text-sm font-bold text-lime-dark hover:brightness-95 disabled:opacity-40">{ocupado?"Guardando…":"Marcar como dictaminado"}</button>
+      <button onClick={()=>accion(()=>apiDictaminado(r.id,nota.trim()),"Marcado como dictaminado.",{agregar:["Dictaminado"],campos:{dictamenLegal:{fecha:new Date().toISOString().slice(0,16),por:(USUARIO&&USUARIO.nombre)||"",nota:nota.trim()||null}}})} disabled={ocupado} className="rounded-lg border border-lime bg-lime px-4 py-2 text-sm font-bold text-lime-dark hover:brightness-95 disabled:opacity-40">{ocupado?"Guardando…":"Marcar como dictaminado"}</button>
     </div>}
 
     {!legal && moral && !enDictamen(r) && !yaDictaminado(r) && <div className="mt-3">
@@ -1395,7 +1395,7 @@ function BloqueDictamen({r, expedienteCompleto, onCambio}){
 
     {!legal && <div className="mt-3 flex flex-wrap gap-2">
       {moral && !enDictamen(r) && !yaDictaminado(r) &&
-        <button onClick={()=>{const a=ABOGADOS.find(x=>x.correo===abogado);accion(()=>apiEnviarLegal(r.id,abogado),`Enviado a dictamen: ${a?(a.correo==="ambos"?"Iván Castillo y Juan Carlos Hernández":a.nombre):""}.`);}} disabled={ocupado||!expedienteCompleto||!abogado}
+        <button onClick={()=>{const a=ABOGADOS.find(x=>x.correo===abogado);accion(()=>apiEnviarLegal(r.id,abogado),`Enviado a dictamen: ${a?(a.correo==="ambos"?"Iván Castillo y Juan Carlos Hernández":a.nombre):""}.`,res=>{const para=(res&&res.para)||(abogado==="ambos"?ABOGADOS.filter(x=>x.correo!=="ambos").map(x=>x.correo):[abogado]);const nombres=ABOGADOS.filter(x=>para.map(c=>String(c).toLowerCase()).includes(x.correo.toLowerCase())).map(x=>x.nombre);const loc=new Date().toISOString().slice(0,16);return {agregar:["En Dictamen"],campos:{enviadoLegal:loc,abogadoDictamen:{para,nombres}}};});}} disabled={ocupado||!expedienteCompleto||!abogado}
           title={!expedienteCompleto?"Primero completa el expediente":(!abogado?"Elige a qué abogado enviarlo":"")}
           className="rounded-lg border border-navy bg-navy px-4 py-2 text-sm font-semibold text-white hover:bg-navy-2 disabled:opacity-40">{ocupado?"Enviando…":"Enviar a dictamen legal"}</button>}
       {yaDictaminado(r) &&
