@@ -82,7 +82,7 @@ const TIPO_PERSONA=["Persona física","Persona moral"];
 const DOCS_LEGALES=["Acta constitutiva","Constancia de situación fiscal del cliente","Asambleas","Poder del representante legal"];
 const DOC_DICTAMEN="Dictamen legal";
 const DOC_MASIVO="Documentos adicionales (carga masiva)";
-const DOCS_POSTERIORES=["Contrato firmado","Contrato en físico","Videos de Firma"];
+const DOCS_POSTERIORES=["Contrato firmado","Contrato en físico","Videos de Firma","Fotos"];
 function listoParaDictamen(r){
   const req=r.requisitos||{};
   return reqListFor(r.tipoCliente).filter(k=>DOCS_POSTERIORES.indexOf(k)<0)
