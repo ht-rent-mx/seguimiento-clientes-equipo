@@ -109,15 +109,30 @@ async function apiEliminar(id,motivo){return USUARIO?await sbRpcU("sc_eliminar_u
 async function apiPapelera(){const d=USUARIO?await sbRpcU("sc_papelera_u",{},2):await sbRpc("sc_papelera",{p_pass:SESION_PASS},2);return Array.isArray(d)?d:[];}
 async function apiRestaurar(pid){return USUARIO?await sbRpcU("sc_restaurar_u",{p_papelera:pid},1):await sbRpc("sc_restaurar",{p_pass:SESION_PASS,p_papelera:pid},1);}
 async function apiBulk(recs){const n=await sbRpc("sc_bulk",{p_pass:SESION_PASS,p_recs:recs});return {ok:true,n:n};}
-async function apiUpload(cliente,doc,nombre,mime,b64){const r=await fetch(UPLOAD_URL,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},body:JSON.stringify({token:UPLOAD_TOKEN,action:"upload",cliente:cliente,doc:doc,nombre:nombre,mime:mime,data:b64})});const txt=await r.text();let j;try{j=JSON.parse(txt);}catch(e){throw new Error("Google Drive no respondió. Intenta de nuevo en un momento.");}if(!j.ok)throw new Error(j.error||"error");return j;}
+const UPLOAD_MAX_MB=25;
+async function apiUpload(cliente,doc,nombre,mime,b64){
+  const mb=(b64.length*3/4)/1048576;
+  if(mb>UPLOAD_MAX_MB)throw new Error(`el archivo pesa ${mb.toFixed(1)} MB y el máximo es ${UPLOAD_MAX_MB} MB. Comprime el PDF o recorta el video y vuelve a intentar.`);
+  const limiteSeg=Math.min(300,Math.round(60+mb*8));
+  const ctl=new AbortController();const to=setTimeout(()=>ctl.abort(),limiteSeg*1000);
+  let r,txt;
+  try{
+    r=await fetch(UPLOAD_URL,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},body:JSON.stringify({token:UPLOAD_TOKEN,action:"upload",cliente:cliente,doc:doc,nombre:nombre,mime:mime,data:b64}),signal:ctl.signal});
+    txt=await r.text();
+  }catch(e){
+    if(e&&e.name==="AbortError")throw new Error(`Google Drive no respondió en ${limiteSeg} segundos (archivo de ${mb.toFixed(1)} MB). Revisa tu conexión a internet e intenta de nuevo; si se repite, avisa a Rogelio Morejón.`);
+    throw new Error("no hay conexión con Google Drive (script.google.com). Revisa tu internet; si estás en la red de la oficina o con VPN, puede estar bloqueado. Avisa a Rogelio Morejón.");
+  }finally{clearTimeout(to);}
+  let j;try{j=JSON.parse(txt);}catch(e){throw new Error("Google Drive no respondió correctamente. Intenta de nuevo en un momento.");}
+  if(!j.ok)throw new Error(j.error||"error");return j;}
 function comprimir(file,maxPx,q){maxPx=maxPx||1600;q=q||0.72;return new Promise((res,rej)=>{
-  if(!/^image\//.test(file.type)){const fr=new FileReader();fr.onload=()=>res({b64:String(fr.result).split(",")[1],mime:file.type||"application/octet-stream",nombre:file.name||"archivo"});fr.onerror=rej;fr.readAsDataURL(file);return;}
+  if(!/^image\//.test(file.type)){const fr=new FileReader();fr.onload=()=>res({b64:String(fr.result).split(",")[1],mime:file.type||"application/octet-stream",nombre:file.name||"archivo"});fr.onerror=()=>rej(new Error("no se pudo leer el archivo."));fr.readAsDataURL(file);return;}
   const fr=new FileReader();fr.onload=()=>{const img=new Image();img.onload=()=>{
     let w=img.width,h=img.height;const s=Math.min(1,maxPx/Math.max(w,h));w=Math.round(w*s);h=Math.round(h*s);
     const c=document.createElement("canvas");c.width=w;c.height=h;c.getContext("2d").drawImage(img,0,0,w,h);
     const d=c.toDataURL("image/jpeg",q);
     res({b64:d.split(",")[1],mime:"image/jpeg",nombre:String(file.name||"escaneo").replace(/\.[^.]+$/,"")+".jpg"});
-  };img.onerror=rej;img.src=String(fr.result);};fr.onerror=rej;fr.readAsDataURL(file);});}
+  };img.onerror=()=>rej(new Error("no se pudo leer la imagen (formato no compatible, p. ej. HEIC). Tómala de nuevo o súbela como JPG o PDF."));img.src=String(fr.result);};fr.onerror=()=>rej(new Error("no se pudo leer el archivo."));fr.readAsDataURL(file);});}
 
 /* ---------- Catálogos ---------- */
 const EJEC_DEF=["Sara Alonso","Aracely de Ochoa","Omar Guevara","Mary Morales"];
