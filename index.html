@@ -1115,6 +1115,570 @@ function Papelera({onClose,onRestaurado}){
     </div>
   </div>);
 }
+/* ============================================================
+   SOLICITUD ALTA DE CLIENTE  +  VALIDACIÓN DE DOCUMENTOS
+   Versión sin costo: todo se lee en el navegador.
+     · Excel de la solicitud → SheetJS (ya cargado)
+     · PDF con texto (CSF del SAT, PDFs digitales) → pdf.js
+     · Escaneos y fotos → Tesseract.js (OCR en español)
+   Nada se envía a servicios de pago. Se guarda dentro de la tarjeta
+   (campo "solicitud"), sin cambios en Supabase.
+   REGLAS AJUSTABLES: SOL_MIN_REF, SOL_FACULTADES_REQ, SOL_CSF_MAX_DIAS,
+   SOL_AVAL_EDAD_AVISO.
+   ============================================================ */
+const SOL_MIN_REF=2;                              // mínimo por tipo de referencia
+const SOL_FACULTADES={
+  administracion:{l:"Actos de administración",re:/ACTOS?\s+DE\s+ADMINISTRACION/},
+  titulos:{l:"Suscribir títulos de crédito",re:/TITULOS?\s+DE\s+CREDITO/},
+  pleitos:{l:"Pleitos y cobranzas",re:/PLEITOS\s+Y\s+COBRANZAS/},
+  dominio:{l:"Actos de dominio",re:/ACTOS?\s+DE\s+DOMINIO/},
+};
+const SOL_FACULTADES_REQ=["administracion","titulos"]; // las que debe tener el representante
+const SOL_CSF_MAX_DIAS=90;                        // antigüedad máxima de la constancia
+const SOL_AVAL_EDAD_AVISO=70;                     // aviso informativo para Legal
+const SOL_USO_CFDI=["G01 Adquisición de mercancias","G02 Devoluciones, descuentos o bonificaciones","G03 Gastos en general","I01 Construcciones","I02 Mobilario y equipo de oficina por inversiones","I03 Equipo de transporte","I04 Equipo de computo y accesorios","I05 Dados, troqueles, moldes, matrices y herramental","I06 Comunicaciones telefónicas","I07 Comunicaciones satelitales","I08 Otra maquinaria y equipo","P01 Por definir"];
+const SOL_METODO=["PUE / PAGO UNA EXHIBICION","PPD / PAGO EN PARCIALIDADES"];
+const SOL_FORMA=["EFECTIVO","CHEQUE","TRANSFERENCIA ELECTRONICA","POR DEFINIR"];
+const SOL_EDO_CIVIL=["SOLTERO","CASADO","UNIÓN LIBRE","DIVORCIADO","VIUDO"];
+const SOL_CLASES_TR=["Tractocamiones","Remolques","Camiones"];
+const SOL_COMBUSTIBLE=/GASOLIN|COMBUSTIBLE|DIESEL|PEMEX|GAS\s?NATURAL|OXXO\s?GAS|G500|ESTACION DE SERVICIO|PETRO|MOBIL|SHELL|BP\b|REPSOL|ARCO\b|TOTAL\s?ENERG/;
+const SOL_PARTICULAS=new Set(["DE","DEL","LA","LAS","LOS","Y","E","MC","MAC","VON","VAN","DA","DI","DAS","EL"]);
+
+/* ---------- estructura vacía ---------- */
+const solPersona=()=>({nombre:"",rfc:"",calle:"",colonia:"",cp:"",municipio:"",estado:"",estadoCivil:"",profesion:"",celular:"",telCasa:"",telOficina:"",correo:""});
+const solRefFam=()=>({nombre:"",direccion:"",telefono:"",parentesco:""});
+const solRefCom=()=>({empresa:"",contacto:"",telefono:"",tiempo:""});
+function solVacia(){return {
+  fiscal:{razonSocial:"",nombreComercial:"",calle:"",colonia:"",cp:"",municipio:"",estado:"",rfc:"",tipoCliente:"",contacto:"",celular:"",correo:"",web:""},
+  rep:solPersona(),
+  avales:[{...solPersona(),tiempo:"",parentesco:""}],
+  pagos:{nombre:"",celular:"",telOficina:"",usoCfdi:"",metodoPago:"",formaPago:"",correosFactura:"",comentarios:""},
+  refFam:[solRefFam(),solRefFam(),solRefFam()],
+  refCli:[solRefCom(),solRefCom(),solRefCom()],
+  refProv:[solRefCom(),solRefCom(),solRefCom()],
+  bancos:[{banco:"",cuenta:"",apertura:"",saldo:"",ejecutivo:"",telefono:""}],
+  transporte:SOL_CLASES_TR.map(c=>({clase:c,tipo:"",marca:"",modelo:"",placa:"",color:""})),
+  docs:{}, revisiones:{}, actualizado:""
+};}
+function solNormaliza(s){const v=solVacia();if(!s)return v;return {...v,...s,
+  fiscal:{...v.fiscal,...(s.fiscal||{})},rep:{...v.rep,...(s.rep||{})},pagos:{...v.pagos,...(s.pagos||{})},
+  avales:(s.avales&&s.avales.length?s.avales:v.avales).map(a=>({...solPersona(),tiempo:"",parentesco:"",...a})),
+  refFam:s.refFam||v.refFam,refCli:s.refCli||v.refCli,refProv:s.refProv||v.refProv,
+  bancos:s.bancos&&s.bancos.length?s.bancos:v.bancos,transporte:s.transporte&&s.transporte.length?s.transporte:v.transporte,
+  docs:s.docs||{},revisiones:s.revisiones||{}};}
+
+/* ---------- normalización y comparación ---------- */
+function solN(s){return String(s==null?"":s).toUpperCase().replace(/Ñ/g,"\u0001").normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/\u0001/g,"Ñ").replace(/[^A-Z0-9Ñ&]+/g," ").trim();}
+function solTokens(s){return solN(s).split(" ").filter(t=>t&&!SOL_PARTICULAS.has(t));}
+const SOL_REGIMEN_RE=/\s+(SOCIEDAD ANONIMA PROMOTORA DE INVERSION|SOCIEDAD ANONIMA BURSATIL|SOCIEDAD ANONIMA|SOCIEDAD DE RESPONSABILIDAD LIMITADA|SOCIEDAD POR ACCIONES SIMPLIFICADA|SOCIEDAD CIVIL|ASOCIACION CIVIL|SOCIEDAD COOPERATIVA|S ?A ?P ?I|S ?A ?B|S ?DE ?R ?L|S ?A ?S|S ?A|S ?C|A ?C|S ?C ?L)( (DE )?(C ?V|CAPITAL VARIABLE|R ?L|RESPONSABILIDAD LIMITADA))*( DE C ?V| DE CAPITAL VARIABLE)?$/;
+function solSinRegimen(s){return solN(s).replace(SOL_REGIMEN_RE,"").trim();}
+function solTieneRegimen(s){return SOL_REGIMEN_RE.test(solN(s));}
+function solSoloDig(s){return String(s==null?"":s).replace(/\D/g,"");}
+function solLev(a,b){if(a===b)return 0;const m=a.length,n=b.length;if(Math.abs(m-n)>2)return 9;let prev=Array.from({length:n+1},(_,j)=>j);for(let i=1;i<=m;i++){const cur=[i];for(let j=1;j<=n;j++)cur[j]=Math.min(prev[j]+1,cur[j-1]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));prev=cur;}return prev[n];}
+function solTokEq(a,b){return a===b||(b.length>=5&&Math.abs(a.length-b.length)<=1&&solLev(a,b)<=1);}
+/* similitud entre dos textos (0..1) por palabras significativas */
+function solSimil(a,b){const A=solTokens(a),B=solTokens(b);if(!A.length||!B.length)return 0;let hit=0;const usados=new Set();
+  A.forEach(t=>{const j=B.findIndex((u,k)=>!usados.has(k)&&solTokEq(u,t));if(j>=0){hit++;usados.add(j);}});return hit/Math.max(A.length,B.length);}
+
+/* ---------- RFC ---------- */
+function solRfc(s){return String(s||"").toUpperCase().replace(/[\s\-\.]/g,"");}
+function solRfcDigito(rfc){const D="0123456789ABCDEFGHIJKLMN&OPQRSTUVWXYZ Ñ";const r=rfc.length===12?" "+rfc:rfc;let s=0;for(let i=0;i<12;i++){const v=D.indexOf(r[i]);if(v<0)return null;s+=v*(13-i);}const res=s%11;if(res===0)return "0";const d=11-res;return d===10?"A":String(d);}
+function solRfcFecha(rfc){const m=rfc.match(/^[A-ZÑ&]{3,4}(\d{2})(\d{2})(\d{2})/);if(!m)return null;const yy=+m[1],mm=+m[2],dd=+m[3];const hoy=new Date();const y=yy>hoy.getFullYear()%100?1900+yy:2000+yy;const d=new Date(y,mm-1,dd);if(d.getMonth()!==mm-1||d.getDate()!==dd)return null;return d;}
+function solEdad(d){if(!d)return null;const h=new Date();let e=h.getFullYear()-d.getFullYear();if(h<new Date(h.getFullYear(),d.getMonth(),d.getDate()))e--;return e;}
+function solPrimVocalInt(w){for(let i=1;i<w.length;i++)if("AEIOU".includes(w[i]))return w[i];return "X";}
+function solIniFisica(nombre){const t=solN(nombre).split(" ").filter(x=>x&&!SOL_PARTICULAS.has(x));if(t.length<3)return [];
+  const out=[];const arma=(pat,mat,noms)=>{let nom=noms[0];if(noms.length>1&&/^(JOSE|J|MARIA|MA|M)$/.test(nom))nom=noms[1];return pat[0]+solPrimVocalInt(pat)+mat[0]+nom[0];};
+  out.push(arma(t[t.length-2],t[t.length-1],t.slice(0,t.length-2)));   // NOMBRE PATERNO MATERNO
+  out.push(arma(t[0],t[1],t.slice(2)));                                  // PATERNO MATERNO NOMBRE
+  return out;}
+const SOL_STOP_MORAL=new Set(["DE","DEL","LA","LAS","LOS","EL","Y","E","EN","PARA","POR","CON","A","SOCIEDAD","COMPANIA","CIA","SOC","COOPERATIVA","MC","MAC","VON","VAN","THE","OF","AND"]);
+function solIniMoral(razon){const t=solSinRegimen(razon).split(" ").filter(x=>x&&!SOL_STOP_MORAL.has(x));if(!t.length)return "";
+  if(t.length>=3)return t[0][0]+t[1][0]+t[2][0];if(t.length===2)return t[0][0]+t[1].slice(0,2);return t[0].slice(0,3);}
+/* revisa un RFC: devuelve lista de {nivel,texto} */
+function solRevisaRfc(rfcIn,nombre,tipo){const out=[];const rfc=solRfc(rfcIn);
+  if(!rfc){out.push({n:"error",t:"Sin RFC capturado"});return out;}
+  const largo=tipo==="moral"?12:13;
+  if(rfc.length!==largo){out.push({n:"error",t:`RFC de ${rfc.length} caracteres; para ${tipo==="moral"?"persona moral son 12":"persona física son 13"}`});return out;}
+  if(!(tipo==="moral"?/^[A-ZÑ&]{3}\d{6}[A-Z0-9]{3}$/:/^[A-ZÑ&]{4}\d{6}[A-Z0-9]{3}$/).test(rfc)){out.push({n:"error",t:"RFC con formato inválido"});return out;}
+  const f=solRfcFecha(rfc);if(!f)out.push({n:"error",t:"La fecha dentro del RFC no es válida"});
+  const dv=solRfcDigito(rfc);if(dv&&dv!==rfc[rfc.length-1])out.push({n:"warn",t:`Dígito verificador no cuadra (esperado ${dv}); revisa que el RFC esté bien escrito`});
+  if(nombre){if(tipo==="moral"){const ini=solIniMoral(nombre);if(ini&&ini!==rfc.slice(0,3))out.push({n:"warn",t:`Las letras del RFC (${rfc.slice(0,3)}) no corresponden a la razón social (se esperaba ${ini})`});}
+    else{const c=solIniFisica(nombre);if(c.length&&c.indexOf(rfc.slice(0,4))<0)out.push({n:"warn",t:`Las letras del RFC (${rfc.slice(0,4)}) no corresponden al nombre (se esperaba ${c[0]})`});}}
+  if(!out.length)out.push({n:"ok",t:"RFC válido y congruente con el nombre"});
+  return out;}
+
+/* ---------- búsqueda de nombres en texto (tolerante a errores de OCR) ---------- */
+function solPalabras(txt){return solN(txt).split(" ").filter(Boolean);}
+function solBuscaNombre(words,nombre){const toks=solTokens(nombre).filter(t=>t.length>1);if(toks.length<2)return [];
+  const W=toks.length+4;const res=[];let ultimo=-99;
+  for(let i=0;i<words.length;i++){if(i<ultimo+W)continue;if(!toks.some(t=>solTokEq(words[i],t)))continue;
+    const ventana=words.slice(i,i+W);const usados=new Set();let ok=true;
+    for(const t of toks){const j=ventana.findIndex((w,k)=>!usados.has(k)&&solTokEq(w,t));if(j<0){ok=false;break;}usados.add(j);}
+    if(ok){res.push(i);ultimo=i;}}
+  return res;}
+const SOL_CARGO_RE=/APODERAD|ADMINISTRADOR UNICO|GERENTE GENERAL|DIRECTOR GENERAL|PRESIDENTE|CONSEJO DE ADMINISTRACION|REPRESENTANTE LEGAL|SE OTORGA|OTORGA PODER|PODER GENERAL|PODER ESPECIAL|SE DESIGNA|SE NOMBRA|NOMBRAMIENTO/;
+const SOL_SOCIO_RE=/SOCIO|ACCIONISTA|ACCIONES|PARTES? SOCIAL|SUSCRIBE|SUSCRITO|APORTACION|COMPARECE/;
+const SOL_REVOCA_RE=/REVOC/;
+/* analiza un nombre dentro del texto de un documento */
+function solAnalizaNombre(words,nombre){const pos=solBuscaNombre(words,nombre);const r={veces:pos.length,cargo:false,socio:false,revocado:false,facultades:[]};
+  const fac=new Set();
+  pos.forEach(i=>{const cerca=words.slice(Math.max(0,i-40),i+60).join(" ");
+    if(SOL_CARGO_RE.test(cerca))r.cargo=true;if(SOL_SOCIO_RE.test(cerca))r.socio=true;
+    if(SOL_REVOCA_RE.test(words.slice(Math.max(0,i-25),i+25).join(" ")))r.revocado=true;
+    const amplio=words.slice(Math.max(0,i-300),i+900).join(" ");
+    Object.keys(SOL_FACULTADES).forEach(k=>{if(SOL_FACULTADES[k].re.test(amplio))fac.add(k);});});
+  r.facultades=[...fac];return r;}
+
+/* ---------- Constancia de situación fiscal (SAT) ---------- */
+const SOL_MESES=["ENERO","FEBRERO","MARZO","ABRIL","MAYO","JUNIO","JULIO","AGOSTO","SEPTIEMBRE","OCTUBRE","NOVIEMBRE","DICIEMBRE"];
+function solLeeCSF(texto){const T=" "+String(texto||"").toUpperCase().replace(/Ñ/g,"\u0001").normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/\u0001/g,"Ñ").replace(/\s+/g," ")+" ";
+  const g=(re)=>{const m=T.match(re);return m?m[1].trim().slice(0,120):"";};
+  const d={
+    rfc:g(/RFC:?\s*([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/),
+    razonSocial:g(/RAZON SOCIAL:?\s*(.+?)\s+(?:REGIMEN CAPITAL|NOMBRE COMERCIAL|FECHA INICIO|ESTATUS)/),
+    regimenCapital:g(/REGIMEN CAPITAL:?\s*(.+?)\s+(?:NOMBRE COMERCIAL|FECHA INICIO|ESTATUS)/),
+    curp:g(/CURP:?\s*([A-Z]{4}\d{6}[HMX][A-Z]{5}[A-Z0-9]\d)/),
+    nombres:g(/NOMBRE ?\(S\):?\s*(.+?)\s+PRIMER APELLIDO/),
+    ap1:g(/PRIMER APELLIDO:?\s*(.+?)\s+SEGUNDO APELLIDO/),
+    ap2:g(/SEGUNDO APELLIDO:?\s*(.*?)\s+(?:FECHA INICIO|ESTATUS|NOMBRE COMERCIAL)/),
+    cp:g(/CODIGO POSTAL:?\s*(\d{5})/),
+    vialidad:g(/NOMBRE DE (?:LA )?VIALIDAD:?\s*(.+?)\s+NUMERO EXTERIOR/),
+    numExt:g(/NUMERO EXTERIOR:?\s*([A-Z0-9\-]+)/),
+    colonia:g(/NOMBRE DE LA COLONIA:?\s*(.+?)\s+NOMBRE DE LA LOCALIDAD|NOMBRE DE LA COLONIA:?\s*(.+?)\s+NOMBRE DEL MUNICIPIO/),
+    municipio:g(/DEMARCACION TERRITORIAL:?\s*(.+?)\s+NOMBRE DE LA ENTIDAD/),
+    estado:g(/ENTIDAD FEDERATIVA:?\s*(.+?)\s+(?:ENTRE CALLE|Y CALLE|ACTIVIDADES|CORREO)/),
+    estatus:g(/ESTATUS EN EL PADRON:?\s*([A-Z]+)/),
+    emision:""};
+  if(!d.colonia){const m=T.match(/NOMBRE DE LA COLONIA:?\s*(.+?)\s+NOMBRE DEL MUNICIPIO/);if(m)d.colonia=m[1].trim();}
+  const em=T.match(/EMISION:?.{0,80}?\b(\d{1,2}) DE ([A-Z]+) DE (\d{4})/);
+  if(em){const mi=SOL_MESES.indexOf(em[2]);if(mi>=0)d.emision=`${em[3]}-${String(mi+1).padStart(2,"0")}-${String(em[1]).padStart(2,"0")}`;}
+  if(!d.razonSocial&&d.nombres)d.razonSocial=[d.nombres,d.ap1,d.ap2].filter(Boolean).join(" ");
+  d.esCSF=/CONSTANCIA DE SITUACION FISCAL|CEDULA DE IDENTIFICACION FISCAL|IDCIF/.test(T)&&!!d.rfc;
+  return d;}
+
+/* ---------- datos encontrados en cualquier documento ---------- */
+function solHallazgos(texto,sol,tipoPersona){const words=solPalabras(texto);const compacto=words.join("");
+  const nombres={};const quien=solQuien(sol,tipoPersona);
+  quien.forEach(p=>{if(p.nombre&&solTokens(p.nombre).length>=2)nombres[solN(p.nombre)]=solAnalizaNombre(words,p.nombre);});
+  const rfcs=[...new Set((compacto.match(/[A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3}/g)||[]))].slice(0,40);
+  const curps=[...new Set((compacto.match(/[A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z0-9]\d/g)||[]))].slice(0,20);
+  const cps=[...new Set((String(texto).match(/\b\d{5}\b/g)||[]))].slice(0,80);
+  const razon=solSinRegimen(sol.fiscal.razonSocial);
+  const facDoc=Object.keys(SOL_FACULTADES).filter(k=>SOL_FACULTADES[k].re.test(words.join(" ")));
+  const dirs={};quien.forEach(p=>{if(p.calle){const ct=solTokens(p.calle).filter(t=>!/^(NUM|NO|NUMERO|CALLE|AV|AVENIDA|BLVD|INT|EXT)$/.test(t));const hit=ct.filter(t=>words.some(w=>solTokEq(w,t)));dirs[solN(p.calle)]={ratio:ct.length?hit.length/ct.length:0};}});
+  return {nombres,rfcs,curps,cps,razonEncontrada:razon?solBuscaNombre(words,razon).length>0||compacto.includes(razon.replace(/ /g,"")):null,facDoc,dirs,palabras:words.length};}
+/* personas que se buscan en los documentos */
+function solQuien(sol,tipoPersona){const out=[];
+  if(tipoPersona==="Persona moral"){if(sol.rep.nombre)out.push({rol:"rep",etq:"Representante legal",...sol.rep});}
+  else if(sol.fiscal.razonSocial)out.push({rol:"rep",etq:"Cliente",...sol.rep,nombre:sol.fiscal.razonSocial,rfc:sol.fiscal.rfc,calle:sol.fiscal.calle,cp:sol.fiscal.cp,colonia:sol.fiscal.colonia});
+  (sol.avales||[]).forEach((a,i)=>{if(a.nombre)out.push({rol:"aval"+i,etq:`Aval ${i+1}`,...a});});
+  return out;}
+
+/* ---------- Importar el Excel de la solicitud ---------- */
+function solDesdeExcel(wb){
+  const nombreHoja=wb.SheetNames.find(n=>/DATOS/i.test(n))||wb.SheetNames[0];const ws=wb.Sheets[nombreHoja];
+  // ancla: renglón de la etiqueta "RAZON SOCIAL" (en la plantilla está en B10)
+  let off=0;for(let r=1;r<=40;r++){const c=ws["B"+r];if(c&&/RAZON SOCIAL/i.test(String(c.v))){off=r-10;break;}}
+  const v=(col,row)=>{const c=ws[col+(row+off)];if(!c||c.v==null)return "";if(c.v instanceof Date)return c.v.toISOString().slice(0,10);return String(c.v).trim();};
+  const s=solVacia();
+  s.fiscal={razonSocial:v("E",10),nombreComercial:v("Q",10),calle:v("E",11),tipoCliente:v("Q",11),colonia:v("E",12),cp:v("E",13),contacto:v("Q",13),municipio:v("E",14),celular:v("Q",14),estado:v("E",15),correo:v("Q",15),rfc:solRfc(v("E",16)),web:v("Q",16)};
+  const per=r=>({nombre:v("E",r),rfc:solRfc(v("S",r)),calle:v("E",r+1),colonia:v("K",r+1),cp:v("O",r+1),municipio:v("R",r+1),estado:v("U",r+1),estadoCivil:v("E",r+2),profesion:v("L",r+2),celular:v("S",r+2),telCasa:v("E",r+3),telOficina:v("L",r+3),correo:v("S",r+3)});
+  s.rep=per(22);
+  s.avales=[{...per(31),tiempo:v("E",35),parentesco:v("L",35)}];
+  s.pagos={nombre:v("E",41),celular:v("L",41),telOficina:v("S",41),usoCfdi:v("E",42),metodoPago:v("L",42),formaPago:v("S",42),correosFactura:v("H",43),comentarios:v("E",44)};
+  s.refFam=[51,52,53].map(r=>({nombre:v("C",r),direccion:v("J",r),telefono:v("Q",r),parentesco:v("T",r)}));
+  s.refCli=[56,57,58].map(r=>({empresa:v("C",r),contacto:v("J",r),telefono:v("Q",r),tiempo:v("T",r)}));
+  s.refProv=[61,62,63].map(r=>({empresa:v("C",r),contacto:v("J",r),telefono:v("Q",r),tiempo:v("T",r)}));
+  s.bancos=[72,73,74].map(r=>({banco:v("C",r),cuenta:v("G",r),apertura:v("J",r),saldo:v("M",r),ejecutivo:v("P",r),telefono:v("T",r)})).filter((b,i)=>i===0||b.banco);
+  s.transporte=[79,80,81].map((r,i)=>({clase:v("C",r)||SOL_CLASES_TR[i],tipo:v("G",r),marca:v("J",r),modelo:v("M",r),placa:v("P",r),color:v("T",r)}));
+  return s;}
+
+/* ---------- Reglas de validación ---------- */
+function solValidar(sol,tipoPersona){
+  const L=[];const add=(grupo,id,n,t)=>L.push({grupo,id,n,t,just:(sol.revisiones||{})[id]||null});
+  const moral=tipoPersona==="Persona moral";const fis=sol.fiscal;
+  const vacio=x=>!String(x==null?"":x).trim();
+  const tel=x=>{const d=solSoloDig(x);return d.length===10||(d.length===12&&d.startsWith("52"));};
+  const mail=x=>/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(x||"").trim());
+  /* 1. captura completa */
+  const req=[["fiscal","Datos fiscales",fis,{razonSocial:"Razón social",calle:"Calle y número",colonia:"Colonia",cp:"C.P.",municipio:"Municipio",estado:"Estado",rfc:"RFC",contacto:"Contacto directo",celular:"Celular",correo:"Correo"}]];
+  if(moral)req.push(["rep","Representante legal",sol.rep,{nombre:"Nombre",rfc:"RFC",calle:"Calle y número",colonia:"Colonia",cp:"C.P.",municipio:"Municipio",estado:"Estado",estadoCivil:"Estado civil",celular:"Celular",correo:"Correo"}]);
+  (sol.avales||[]).forEach((a,i)=>req.push(["aval"+i,`Aval ${i+1}`,a,{nombre:"Nombre",rfc:"RFC",calle:"Calle y número",colonia:"Colonia",cp:"C.P.",municipio:"Municipio",estado:"Estado",estadoCivil:"Estado civil",celular:"Celular"}]));
+  req.push(["pagos","Responsable de pagos",sol.pagos,{nombre:"Nombre",usoCfdi:"Uso CFDI",metodoPago:"Método de pago",formaPago:"Forma de pago",correosFactura:"Correos para facturas"}]);
+  req.forEach(([k,etq,obj,campos])=>{const f=Object.keys(campos).filter(c=>vacio(obj[c])).map(c=>campos[c]);
+    add("Captura","cap-"+k,f.length?"error":"ok",f.length?`${etq}: falta ${f.join(", ")}`:`${etq}: completo`);});
+  if(!(sol.avales||[]).some(a=>a.nombre))add("Captura","cap-sin-aval","error","No hay aval capturado");
+  /* formatos */
+  const fmt=[];const chkCP=(x,etq)=>{if(!vacio(x)&&!/^\d{5}$/.test(String(x).trim()))fmt.push(["error",`${etq}: C.P. debe tener 5 dígitos`]);};
+  const chkTel=(x,etq)=>{if(!vacio(x)&&!tel(x))fmt.push(["warn",`${etq}: teléfono "${x}" no tiene 10 dígitos`]);};
+  const chkMail=(x,etq)=>{if(!vacio(x))String(x).split(/[;,\s]+/).filter(Boolean).forEach(m=>{if(!mail(m))fmt.push(["warn",`${etq}: correo "${m}" no es válido`]);});};
+  chkCP(fis.cp,"Datos fiscales");chkTel(fis.celular,"Datos fiscales");chkMail(fis.correo,"Datos fiscales");
+  if(moral){chkCP(sol.rep.cp,"Representante");chkTel(sol.rep.celular,"Representante");chkTel(sol.rep.telOficina,"Representante (oficina)");chkMail(sol.rep.correo,"Representante");}
+  (sol.avales||[]).forEach((a,i)=>{chkCP(a.cp,`Aval ${i+1}`);chkTel(a.celular,`Aval ${i+1}`);chkMail(a.correo,`Aval ${i+1}`);});
+  chkTel(sol.pagos.celular,"Responsable de pagos");chkMail(sol.pagos.correosFactura,"Correos de facturación");
+  fmt.forEach(x=>add("Captura","fmt-"+solN(x[1]).replace(/ /g,"").slice(0,60),x[0],x[1]));
+  if(moral&&fis.razonSocial&&!solTieneRegimen(fis.razonSocial))add("Captura","cap-regimen","warn","La razón social no trae el régimen (S.A. de C.V., S. de R.L., S.A.P.I.…); confírmalo contra la constancia y el acta");
+  if(!sol.transporte.some(t=>t.tipo||t.marca||t.placa))add("Captura","cap-transporte","warn","No hay unidades de transporte (con las que moverán los equipos)");
+  if(!sol.bancos.some(b=>b.banco))add("Captura","cap-bancos","warn","Sin referencias bancarias");
+
+  /* 2. referencias */
+  const cuenta=(lista,campo)=>lista.filter(r=>!vacio(r[campo])&&solSoloDig(r.telefono).length>=10).length;
+  [["refFam","Familiares","nombre"],["refCli","Clientes","empresa"],["refProv","Proveedores","empresa"]].forEach(([k,etq,campo])=>{
+    const lista=sol[k]||[];const n=cuenta(lista,campo);const incompletas=lista.filter(r=>!vacio(r[campo])&&solSoloDig(r.telefono).length<10).length;
+    add("Referencias","ref-"+k,n>=SOL_MIN_REF?"ok":"error",`Referencias de ${etq.toLowerCase()}: ${n} de ${SOL_MIN_REF} mínimo${incompletas?` (${incompletas} sin teléfono completo)`:""}`);});
+  const tels={};const marca=(t,de)=>{const d=solSoloDig(t).slice(-10);if(d.length===10)(tels[d]=tels[d]||[]).push(de);};
+  sol.refFam.forEach(r=>marca(r.telefono,"ref. familiar "+(r.nombre||"")));sol.refCli.forEach(r=>marca(r.telefono,"ref. cliente "+(r.empresa||"")));sol.refProv.forEach(r=>marca(r.telefono,"ref. proveedor "+(r.empresa||"")));
+  const propios=new Set([fis.celular,sol.rep.celular,...sol.avales.map(a=>a.celular)].map(x=>solSoloDig(x).slice(-10)).filter(x=>x.length===10));
+  Object.keys(tels).forEach(t=>{if(tels[t].length>1)add("Referencias","ref-dup-"+t,"warn",`Mismo teléfono ${t} en: ${tels[t].join(" · ")}`);if(propios.has(t))add("Referencias","ref-propio-"+t,"error",`El teléfono ${t} de ${tels[t][0]} es del propio cliente, representante o aval`);});
+  const apellidos=new Set([...solTokens(sol.rep.nombre).slice(-2),...sol.avales.flatMap(a=>solTokens(a.nombre).slice(-2))].filter(t=>t.length>3));
+  [...sol.refCli.map(r=>["cliente",r]),...sol.refProv.map(r=>["proveedor",r])].forEach(([tipo,r],i)=>{const nom=[r.empresa,r.contacto].join(" ");if(vacio(nom))return;
+    if(SOL_COMBUSTIBLE.test(solN(nom)))add("Referencias","ref-comb-"+i,"error",`"${r.empresa}" parece proveedor de combustible: no cuenta como referencia comercial`);
+    const fam=solTokens(nom).filter(t=>apellidos.has(t));if(fam.length)add("Referencias","ref-fam-"+i,"warn",`Ref. de ${tipo} "${r.empresa}" comparte apellido (${fam.join(", ")}) con el representante o aval: confirmar que no sea negocio de familiar directo`);});
+
+  /* 3. RFC, edad y reglas de personas */
+  const tipoCli=moral?"moral":"fisica";
+  solRevisaRfc(fis.rfc,fis.razonSocial,tipoCli).forEach((x,i)=>add("RFC y personas","rfc-cli-"+i,x.n,"Cliente: "+x.t));
+  if(moral){const r=solRfc(sol.rep.rfc);
+    solRevisaRfc(r,sol.rep.nombre,"fisica").forEach((x,i)=>add("RFC y personas","rfc-rep-"+i,x.n,"Representante: "+x.t));
+    const e=solEdad(solRfcFecha(r));if(e!=null&&e<18)add("RFC y personas","rep-edad","error",`Representante menor de edad según RFC (${e} años)`);}
+  else{const e=solEdad(solRfcFecha(solRfc(fis.rfc)));if(e!=null&&e<18)add("RFC y personas","cli-edad","error",`Cliente menor de edad según RFC (${e} años)`);}
+  (sol.avales||[]).forEach((a,i)=>{if(!a.nombre)return;const r=solRfc(a.rfc);const etq=`Aval ${i+1} (${a.nombre})`;
+    if(r.length===12)add("RFC y personas","aval-moral-"+i,"info",`${etq}: es persona moral; Legal debe revisar sus poderes`);
+    else solRevisaRfc(r,a.nombre,"fisica").forEach((x,j)=>add("RFC y personas","rfc-aval-"+i+"-"+j,x.n,etq+": "+x.t));
+    const e=solEdad(solRfcFecha(r));
+    if(r.length===13&&e!=null&&e<18)add("RFC y personas","aval-edad-"+i,"error",`${etq}: menor de edad según RFC`);
+    if(r.length===13&&e!=null&&e>=SOL_AVAL_EDAD_AVISO)add("RFC y personas","aval-edad70-"+i,"info",`${etq}: ${e} años según RFC; avisar a Legal`);
+    if(solRfc(fis.rfc)&&r===solRfc(fis.rfc))add("RFC y personas","aval-cli-"+i,"error",`${etq}: el aval no puede ser el mismo cliente`);
+    if(/CASAD/.test(solN(a.estadoCivil)))add("RFC y personas","aval-casado-"+i,"info",`${etq}: casado; Legal puede requerir la firma o el consentimiento del cónyuge`);});
+
+  /* 4. documentos */
+  const docs=sol.docs||{};
+  const ver=(k)=>{const d=docs[k];return Array.isArray(d)?d:(d?[d]:[]);};
+  // Constancia del cliente
+  ver("csf_cliente").forEach((d,ix)=>{const c=d.csf||{};const g="Constancia fiscal";const id=`csf-${ix}-`;
+    if(!c.esCSF){add(g,id+"leida","warn",`"${d.archivo}": no se reconoció como constancia del SAT; súbela en PDF original descargado del SAT`);return;}
+    add(g,id+"rfc",solRfc(c.rfc)===solRfc(fis.rfc)?"ok":"error",`RFC: constancia ${c.rfc||"—"} · captura ${fis.rfc||"—"}`);
+    if(c.razonSocial){const s=solSimil(solSinRegimen(c.razonSocial),solSinRegimen(fis.razonSocial));add(g,id+"razon",s>=.85?"ok":s>=.5?"warn":"error",`Razón social: constancia "${c.razonSocial}"${c.regimenCapital?" ("+c.regimenCapital+")":""} · captura "${fis.razonSocial||"—"}"`);}
+    if(c.cp)add(g,id+"cp",c.cp===String(fis.cp).trim()?"ok":"error",`C.P.: constancia ${c.cp} · captura ${fis.cp||"—"}`);
+    if(c.vialidad){const s=solSimil([c.vialidad,c.numExt].join(" "),fis.calle);add(g,id+"calle",s>=.7?"ok":"warn",`Calle: constancia "${c.vialidad} ${c.numExt||""}" · captura "${fis.calle||"—"}"`);}
+    if(c.colonia){const s=solSimil(c.colonia,fis.colonia);add(g,id+"col",s>=.7?"ok":"warn",`Colonia: constancia "${c.colonia}" · captura "${fis.colonia||"—"}"`);}
+    if(c.municipio){const s=solSimil(c.municipio,fis.municipio);add(g,id+"mun",s>=.7?"ok":"warn",`Municipio: constancia "${c.municipio}" · captura "${fis.municipio||"—"}"`);}
+    if(c.estatus)add(g,id+"estatus",c.estatus==="ACTIVO"?"ok":"error",`Estatus en el padrón del SAT: ${c.estatus}`);
+    if(c.emision){const dias=Math.floor((Date.now()-new Date(c.emision+"T12:00:00").getTime())/86400000);add(g,id+"emision",dias<=SOL_CSF_MAX_DIAS?"ok":"warn",`Emitida el ${c.emision} (${dias} días)${dias>SOL_CSF_MAX_DIAS?` · más de ${SOL_CSF_MAX_DIAS} días, pedir una actualizada`:""}`);}});
+  // Constancias de avales
+  (sol.avales||[]).forEach((a,i)=>ver("csf_aval_"+i).forEach((d,ix)=>{const c=d.csf||{};const g="Constancia fiscal";const id=`csfa-${i}-${ix}-`;const etq=`Aval ${i+1}`;
+    if(!c.esCSF){add(g,id+"leida","warn",`${etq} · "${d.archivo}": no se reconoció como constancia del SAT`);return;}
+    add(g,id+"rfc",solRfc(c.rfc)===solRfc(a.rfc)?"ok":"error",`${etq} · RFC: constancia ${c.rfc||"—"} · captura ${a.rfc||"—"}`);
+    if(c.razonSocial){const s=solSimil(c.razonSocial,a.nombre);add(g,id+"nom",s>=.85?"ok":s>=.5?"warn":"error",`${etq} · Nombre: constancia "${c.razonSocial}" · captura "${a.nombre||"—"}"`);}
+    if(c.cp)add(g,id+"cp",c.cp===String(a.cp).trim()?"ok":"warn",`${etq} · C.P.: constancia ${c.cp} · captura ${a.cp||"—"}`);
+    if(c.estatus&&c.estatus!=="ACTIVO")add(g,id+"estatus","warn",`${etq} · Estatus en el padrón: ${c.estatus}`);}));
+
+  // Identificaciones (INE): nombre y CURP vs RFC
+  const quien=solQuien(sol,tipoPersona);
+  const ident=(slot,p)=>ver(slot).forEach((d,ix)=>{const h=d.hall||{};const g="Identificaciones";const id=`${slot}-${ix}-`;const k=solN(p.nombre);
+    if(!h.nombres||!(k in h.nombres)){add(g,id+"stale","warn",`${p.etq}: el nombre cambió desde que se leyó "${d.archivo}"; vuelve a cargarla`);return;}
+    add(g,id+"nom",h.nombres[k].veces?"ok":"warn",h.nombres[k].veces?`${p.etq}: el nombre aparece en la identificación`:`${p.etq}: no se encontró "${p.nombre}" en "${d.archivo}" (puede ser calidad de la foto; revisa a ojo)`);
+    const r=solRfc(p.rfc);if(r.length===13&&(h.curps||[]).length){const ok=h.curps.some(c=>c.slice(0,10)===r.slice(0,10));add(g,id+"curp",ok?"ok":"warn",ok?`${p.etq}: la CURP de la identificación coincide con el RFC`:`${p.etq}: CURP leída ${h.curps[0]} no coincide con el RFC ${r}`);}});
+  quien.forEach(p=>{if(p.rol==="rep")ident("ine_rep",p);else ident("ine_aval_"+p.rol.slice(4),p);});
+
+  // Comprobantes de domicilio
+  const domic=(slot,p)=>ver(slot).forEach((d,ix)=>{const h=d.hall||{};const g="Domicilios";const id=`${slot}-${ix}-`;
+    if(p.cp)add(g,id+"cp",(h.cps||[]).includes(String(p.cp).trim())?"ok":"warn",(h.cps||[]).includes(String(p.cp).trim())?`${p.etq}: el C.P. ${p.cp} aparece en el comprobante`:`${p.etq}: no se encontró el C.P. ${p.cp} en "${d.archivo}"`);
+    const dk=solN(p.calle);if(dk&&h.dirs&&dk in h.dirs){const r=h.dirs[dk].ratio;add(g,id+"calle",r>=.6?"ok":"warn",r>=.6?`${p.etq}: la calle coincide con el comprobante`:`${p.etq}: la calle "${p.calle}" no se encontró completa en el comprobante`);}});
+  quien.forEach(p=>{if(p.rol==="rep"){if(moral)domic("domicilio_cliente",{...p,etq:"Cliente",calle:fis.calle,cp:fis.cp});else domic("domicilio_cliente",p);}else domic("domicilio_aval_"+p.rol.slice(4),p);});
+
+  // Acta, asambleas y poder (persona moral)
+  if(moral){const legales=[...ver("acta").map(d=>["Acta constitutiva",d]),...ver("asambleas").map(d=>["Asamblea",d]),...ver("poder").map(d=>["Poder",d])];const g="Acta, asambleas y poderes";
+    if(!legales.length)add(g,"leg-sin","info","Aún no se cargan acta constitutiva, asambleas ni poder para validar al representante y avales");
+    else{
+      ver("acta").forEach((d,ix)=>{const h=d.hall||{};if(h.razonEncontrada===false)add(g,"acta-razon-"+ix,"warn",`No se encontró la razón social "${solSinRegimen(fis.razonSocial)}" en el acta "${d.archivo}"`);
+        else if(h.razonEncontrada)add(g,"acta-razon-"+ix,"ok","La razón social aparece en el acta constitutiva");
+        const ini=solRfcFecha(solRfc(fis.rfc));if(ini&&d.fechaActa&&d.fechaActa!==ini.toISOString().slice(0,10))add(g,"acta-fecha-"+ix,"info",`Fecha del RFC ${ini.toISOString().slice(0,10)} distinta a la del acta ${d.fechaActa}`);});
+      const junta=(nombre)=>{const k=solN(nombre);const r={veces:0,cargo:false,socio:false,revocado:false,facultades:new Set(),stale:false,en:[]};
+        legales.forEach(([tipo,d])=>{const h=(d.hall||{}).nombres||{};if(!(k in h)){r.stale=true;return;}const x=h[k];if(x.veces){r.veces+=x.veces;r.en.push(tipo);if(x.cargo)r.cargo=true;if(x.socio)r.socio=true;if(x.revocado&&tipo!=="Acta constitutiva")r.revocado=true;x.facultades.forEach(f=>r.facultades.add(f));}});return r;};
+      if(sol.rep.nombre){const r=junta(sol.rep.nombre);const e="Representante "+sol.rep.nombre;
+        if(r.stale)add(g,"rep-stale","warn",`${e}: el nombre cambió desde que se leyeron los documentos; vuelve a cargarlos`);
+        if(!r.veces)add(g,"rep-aparece","error",`${e}: no aparece en el acta, asambleas ni poder cargados`);
+        else{add(g,"rep-aparece","ok",`${e}: aparece en ${[...new Set(r.en)].join(", ")}`);
+          add(g,"rep-cargo",r.cargo?"ok":"warn",r.cargo?`${e}: se le nombra con cargo o poder`:`${e}: aparece, pero no se detectó cerca un nombramiento o poder; revisar`);
+          SOL_FACULTADES_REQ.forEach(f=>add(g,"rep-fac-"+f,r.facultades.has(f)?"ok":"error",`${e}: ${SOL_FACULTADES[f].l} — ${r.facultades.has(f)?"encontrada":"NO encontrada"}`));
+          Object.keys(SOL_FACULTADES).filter(f=>SOL_FACULTADES_REQ.indexOf(f)<0&&r.facultades.has(f)).forEach(f=>add(g,"rep-facx-"+f,"info",`${e}: también tiene ${SOL_FACULTADES[f].l}`));
+          if(r.revocado)add(g,"rep-revoca","error",`${e}: aparece junto a una REVOCACIÓN en asamblea o poder; confirmar que el poder sigue vigente`);}}
+      (sol.avales||[]).forEach((a,i)=>{if(!a.nombre||(a.rfc&&solRfc(a.rfc).length===12))return;const r=junta(a.nombre);const e=`Aval ${i+1} ${a.nombre}`;
+        if(r.stale)add(g,"aval-stale-"+i,"warn",`${e}: el nombre cambió desde que se leyeron los documentos; vuelve a cargarlos`);
+        else if(r.veces&&r.socio)add(g,"aval-socio-"+i,"ok",`${e}: aparece como socio/accionista (${[...new Set(r.en)].join(", ")})`);
+        else if(r.veces)add(g,"aval-socio-"+i,"warn",`${e}: aparece en ${[...new Set(r.en)].join(", ")}, pero no se detectó como socio/accionista`);
+        else add(g,"aval-socio-"+i,"warn",`${e}: no aparece en acta ni asambleas (aval externo); confirmar con Legal si se acepta`);});
+    }}
+
+  // Solicitud firmada (PDF/foto): que coincidan los datos clave
+  ver("solicitud").forEach((d,ix)=>{if(d.metodo==="excel")return;const h=d.hall||{};const g="Solicitud firmada";
+    const rf=[["Cliente",fis.rfc],...(moral?[["Representante",sol.rep.rfc]]:[]),...sol.avales.map((a,i)=>[`Aval ${i+1}`,a.rfc])].filter(x=>x[1]);
+    rf.forEach(([q,r],j)=>{const ok=(h.rfcs||[]).includes(solRfc(r));add(g,`solpdf-${ix}-${j}`,ok?"ok":"warn",ok?`RFC de ${q} coincide con la solicitud firmada`:`No se leyó el RFC ${solRfc(r)} (${q}) en la solicitud firmada; revisar a ojo`);});
+    if(h.razonEncontrada===false)add(g,`solpdf-${ix}-razon`,"warn","No se leyó la razón social en la solicitud firmada");});
+  return L;}
+function solResumen(L){const c={error:0,warn:0,ok:0,info:0};L.forEach(x=>{if(x.just&&x.n!=="ok")c.ok++;else c[x.n]++;});return c;}
+function solAvance(sol,tipoPersona){const moral=tipoPersona==="Persona moral";const campos=[];
+  ["razonSocial","calle","colonia","cp","municipio","estado","rfc","contacto","celular","correo"].forEach(k=>campos.push(sol.fiscal[k]));
+  if(moral)["nombre","rfc","calle","colonia","cp","municipio","estado","estadoCivil","celular","correo"].forEach(k=>campos.push(sol.rep[k]));
+  const a=sol.avales[0]||{};["nombre","rfc","calle","colonia","cp","municipio","estado","estadoCivil","celular"].forEach(k=>campos.push(a[k]));
+  ["nombre","usoCfdi","metodoPago","formaPago","correosFactura"].forEach(k=>campos.push(sol.pagos[k]));
+  [["refFam","nombre"],["refCli","empresa"],["refProv","empresa"]].forEach(([k,c])=>{for(let i=0;i<SOL_MIN_REF;i++){const r=(sol[k]||[])[i]||{};campos.push(r[c]&&r.telefono?"x":"");}});
+  const llenos=campos.filter(x=>String(x==null?"":x).trim()).length;return Math.round(100*llenos/campos.length);}
+
+
+/* ---------- Lectores (se descargan solo cuando se usan) ---------- */
+const SOL_PDFJS="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+const SOL_PDFJS_WORKER="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+const SOL_TESS="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+const _solScripts={};
+function solCargarScript(src){if(!_solScripts[src])_solScripts[src]=new Promise((res,rej)=>{const s=document.createElement("script");s.src=src;s.async=true;s.onload=res;s.onerror=()=>{delete _solScripts[src];rej(new Error("no se pudo descargar el lector de documentos. Revisa tu internet e intenta de nuevo."));};document.head.appendChild(s);});return _solScripts[src];}
+async function solOcrWorker(onProg){await solCargarScript(SOL_TESS);onProg&&onProg("Preparando lector OCR (la primera vez tarda un poco)…",0);return await window.Tesseract.createWorker("spa");}
+const SOL_TEXTOS={}; // texto leído en esta sesión (para revalidar sin volver a leer)
+async function solLeerArchivo(file,{onProg,cancel}){
+  const nombre=file.name||"archivo";const tipo=file.type||"";
+  if(/\.(xlsx|xlsm|xls)$/i.test(nombre)){const buf=await file.arrayBuffer();return {metodo:"excel",wb:XLSX.read(buf,{type:"array",cellDates:true})};}
+  if(/pdf/i.test(tipo)||/\.pdf$/i.test(nombre)){
+    await solCargarScript(SOL_PDFJS);window.pdfjsLib.GlobalWorkerOptions.workerSrc=SOL_PDFJS_WORKER;
+    const pdf=await window.pdfjsLib.getDocument({data:await file.arrayBuffer()}).promise;const n=pdf.numPages;
+    const partes=[];let ocr=0;let worker=null;
+    try{for(let p=1;p<=n;p++){if(cancel&&cancel.v)throw new Error("lectura cancelada.");
+      onProg&&onProg(`Leyendo página ${p} de ${n}…`,(p-1)/n);
+      const page=await pdf.getPage(p);const tc=await page.getTextContent();let t=tc.items.map(i=>i.str).join(" ");
+      if(t.replace(/\s/g,"").length<40){ // página escaneada → OCR
+        if(!worker)worker=await solOcrWorker(onProg);
+        const vp=page.getViewport({scale:2});const c=document.createElement("canvas");c.width=vp.width;c.height=vp.height;
+        await page.render({canvasContext:c.getContext("2d"),viewport:vp}).promise;
+        onProg&&onProg(`Reconociendo texto escaneado · página ${p} de ${n}…`,(p-.5)/n);
+        t=(await worker.recognize(c)).data.text;ocr++;c.width=c.height=0;}
+      partes.push(t);}}
+    finally{if(worker)await worker.terminate();}
+    return {metodo:ocr===0?"texto":ocr===n?"ocr":"mixto",texto:partes.join("\n"),paginas:n,ocrPags:ocr};}
+  if(/^image\//i.test(tipo)||/\.(jpe?g|png|webp|bmp)$/i.test(nombre)){
+    if(/heic|heif/i.test(tipo+nombre))throw new Error("las fotos HEIC de iPhone no se pueden leer; mándala como JPG o PDF.");
+    const w=await solOcrWorker(onProg);try{onProg&&onProg("Reconociendo texto de la imagen…",.5);return {metodo:"ocr",texto:(await w.recognize(file)).data.text,paginas:1,ocrPags:1};}finally{await w.terminate();}}
+  throw new Error("formato no compatible. Usa PDF, JPG/PNG o el Excel de la solicitud.");}
+
+/* documentos que se pueden validar */
+function solSlots(sol,tipoPersona){const moral=tipoPersona==="Persona moral";const L=[
+  {k:"solicitud",l:"Solicitud Alta de Cliente",d:"Excel (llena la captura) o PDF/foto firmada (compara RFC y razón social)",up:DOC_MASIVO,acc:".xlsx,.xlsm,.xls,.pdf,image/*"},
+  {k:"csf_cliente",l:"Constancia de situación fiscal del cliente",d:"PDF descargado del SAT: compara RFC, razón social, domicilio, estatus y fecha",up:"Constancia de situación fiscal del cliente",csf:true}];
+  if(moral)L.push({k:"acta",l:"Acta constitutiva",d:"Busca razón social, representante, avales como socios y facultades",up:"Acta constitutiva"},
+    {k:"asambleas",l:"Actas de asambleas",d:"Puedes cargar varias. Detecta nombramientos, facultades y revocaciones",up:"Asambleas",multi:true},
+    {k:"poder",l:"Poder del representante legal",d:"Si el poder está en escritura aparte del acta",up:"Poder del representante legal"});
+  L.push({k:"ine_rep",l:moral?"Identificación del representante legal":"Identificación del cliente",d:"Nombre y CURP contra el RFC (lectura por OCR)",up:"Identificación del cliente"},
+    {k:"domicilio_cliente",l:"Comprobante de domicilio del cliente",d:"C.P. y calle",up:"Comprobante de domicilio del cliente"});
+  (sol.avales||[]).forEach((a,i)=>{const q=`Aval ${i+1}${a.nombre?" · "+a.nombre:""}`;
+    L.push({k:"csf_aval_"+i,l:`Constancia fiscal — ${q}`,d:"RFC, nombre y C.P.",up:"Constancia de situación fiscal del aval",csf:true},
+      {k:"ine_aval_"+i,l:`Identificación — ${q}`,d:"Nombre y CURP contra el RFC",up:"Identificación del aval"},
+      {k:"domicilio_aval_"+i,l:`Comprobante de domicilio — ${q}`,d:"C.P. y calle",up:"Comprobante de domicilio del aval"});});
+  return L;}
+
+/* ---------- piezas de captura ---------- */
+function SolIn({l,v,on,c,ro,type,list,ph,mono}){return (<label className={`block min-w-0 ${c||""}`}><span className="block truncate text-[10px] font-semibold uppercase tracking-wide text-slate-500">{l}</span>
+  <input type={type||"text"} list={list} value={v==null?"":v} onChange={e=>on(e.target.value)} disabled={ro} placeholder={ph||""} className={`mt-0.5 w-full rounded-md border border-stone-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-navy focus:ring-2 focus:ring-slate-100 disabled:bg-stone-50 disabled:text-slate-600 ${mono?"mono":""}`}/></label>);}
+function SolSec({t,n,extra,children}){return (<section className="rounded-xl border border-stone-200 bg-white">
+  <div className="flex flex-wrap items-center justify-between gap-2 rounded-t-xl border-b border-stone-200 bg-stone-50 px-3 py-2"><h3 className="text-sm font-bold text-navy">{n?<span className="mr-1.5 inline-grid h-5 w-5 place-items-center rounded-full bg-navy text-[11px] text-white">{n}</span>:null}{t}</h3>{extra}</div>
+  <div className="p-3">{children}</div></section>);}
+function SolPersona({p,on,ro,aval}){const s=(k,v)=>on({...p,[k]:k==="rfc"?solRfc(v):v});return (<div className="grid grid-cols-2 gap-2 sm:grid-cols-6">
+  <SolIn c="col-span-2 sm:col-span-4" l="Nombre completo" v={p.nombre} on={v=>s("nombre",v)} ro={ro}/>
+  <SolIn c="col-span-2 sm:col-span-2" l="RFC" v={p.rfc} on={v=>s("rfc",v)} ro={ro} mono/>
+  <SolIn c="col-span-2 sm:col-span-3" l="Calle y número" v={p.calle} on={v=>s("calle",v)} ro={ro}/>
+  <SolIn c="col-span-1 sm:col-span-2" l="Colonia" v={p.colonia} on={v=>s("colonia",v)} ro={ro}/>
+  <SolIn c="col-span-1 sm:col-span-1" l="C.P." v={p.cp} on={v=>s("cp",v)} ro={ro} mono/>
+  <SolIn c="col-span-1 sm:col-span-2" l="Municipio" v={p.municipio} on={v=>s("municipio",v)} ro={ro}/>
+  <SolIn c="col-span-1 sm:col-span-2" l="Estado" v={p.estado} on={v=>s("estado",v)} ro={ro}/>
+  <SolIn c="col-span-1 sm:col-span-2" l="Estado civil" v={p.estadoCivil} on={v=>s("estadoCivil",v)} ro={ro} list="sol-edocivil"/>
+  <SolIn c="col-span-1 sm:col-span-2" l="Profesión" v={p.profesion} on={v=>s("profesion",v)} ro={ro}/>
+  <SolIn c="col-span-1 sm:col-span-2" l="Tel. celular" v={p.celular} on={v=>s("celular",v)} ro={ro} mono/>
+  <SolIn c="col-span-1 sm:col-span-2" l="Correo" v={p.correo} on={v=>s("correo",v)} ro={ro}/>
+  <SolIn c="col-span-1 sm:col-span-2" l="Tel. casa" v={p.telCasa} on={v=>s("telCasa",v)} ro={ro} mono/>
+  <SolIn c="col-span-1 sm:col-span-2" l="Tel. oficina" v={p.telOficina} on={v=>s("telOficina",v)} ro={ro} mono/>
+  {aval && <SolIn c="col-span-1 sm:col-span-2" l="Tiempo de conocerlo" v={p.tiempo} on={v=>s("tiempo",v)} ro={ro}/>}
+  {aval && <SolIn c="col-span-1 sm:col-span-2" l="Parentesco" v={p.parentesco} on={v=>s("parentesco",v)} ro={ro}/>}
+</div>);}
+function SolRefs({titulo,lista,on,ro,cols}){const n=lista.filter(r=>String(r[cols[0][0]]||"").trim()&&solSoloDig(r.telefono).length>=10).length;const ok=n>=SOL_MIN_REF;
+  const set=(i,k,v)=>on(lista.map((r,j)=>j===i?{...r,[k]:v}:r));
+  return (<div className="mb-3 last:mb-0"><div className="mb-1 flex items-center justify-between"><span className="text-xs font-bold uppercase tracking-wide text-slate-600">{titulo}</span><span className={`rounded-full px-2 py-0.5 text-[11px] font-bold ${ok?"bg-emerald-100 text-emerald-700":"bg-rose-100 text-rose-700"}`}>{n} de {SOL_MIN_REF} mín. {ok?"✓":""}</span></div>
+    <div className="space-y-2">{lista.map((r,i)=>(<div key={i} className="grid grid-cols-2 gap-2 rounded-lg border border-stone-200 bg-stone-50/60 p-2 sm:grid-cols-12">
+      {cols.map(([k,l,w])=><SolIn key={k} c={w} l={l} v={r[k]} on={v=>set(i,k,v)} ro={ro} mono={k==="telefono"}/>)}
+      {!ro && lista.length>SOL_MIN_REF && <button onClick={()=>on(lista.filter((_,j)=>j!==i))} className="col-span-2 text-left text-[11px] font-semibold text-slate-400 hover:text-red-500 sm:col-span-12">Quitar renglón</button>}
+    </div>))}</div>
+    {!ro && <button onClick={()=>on([...lista,Object.fromEntries(cols.map(c=>[c[0],""]))])} className="mt-1.5 text-xs font-semibold text-navy hover:underline">+ Agregar referencia</button>}
+  </div>);}
+const SOL_ICONO={error:["✕","bg-rose-600 text-white"],warn:["!","bg-amber-400 text-amber-950"],ok:["✓","bg-emerald-600 text-white"],info:["i","bg-sky-100 text-sky-700"]};
+
+/* ---------- Ventana de la solicitud ---------- */
+function SolicitudAlta({f,puedeEditar,onClose,onAplicar,subirDoc}){
+  const llave="sol-borrador-"+(f.id||"nuevo");
+  const [sol,setSolS]=useState(()=>{const base=solNormaliza(f.solicitud);try{const b=JSON.parse(localStorage.getItem(llave)||"null");if(b&&b.guardado>(base.actualizado||"")&&window.confirm("Hay una captura de la solicitud que no se aplicó a la tarjeta. ¿Recuperarla?"))return solNormaliza(b.sol);}catch(e){}return base;});
+  const solRef=React.useRef(sol);
+  const tipoPersona=f.tipoPersona||(solRfc(sol.fiscal.rfc).length===13?"Persona física":"Persona moral");
+  const setSol=fn=>setSolS(p=>{const n=typeof fn==="function"?fn(p):fn;solRef.current=n;try{localStorage.setItem(llave,JSON.stringify({guardado:new Date().toISOString(),sol:n}));}catch(e){}return n;});
+  const [tab,setTab]=useState("captura");const [prog,setProg]=useState(null);const [subirTambien,setSubirTambien]=useState(true);
+  const cancelRef=React.useRef({v:false});const ro=!puedeEditar;
+  const moral=tipoPersona==="Persona moral";
+  const L=useMemo(()=>solValidar(sol,tipoPersona),[sol,tipoPersona]);const res=solResumen(L);const avance=solAvance(sol,tipoPersona);
+  const setF2=(sec,k,v)=>setSol(p=>({...p,[sec]:{...p[sec],[k]:k==="rfc"?solRfc(v):v}}));
+  const slots=solSlots(sol,tipoPersona);
+
+  function importarExcel(wb,archivo){const nueva=solDesdeExcel(wb);
+    if(!nueva.fiscal.razonSocial&&!nueva.fiscal.rfc){alert("El Excel no tiene el formato de la Solicitud Alta de Cliente (hoja DATOS CLIENTE).");return false;}
+    const hay=solAvance(solRef.current,tipoPersona)>10;
+    if(hay&&!window.confirm("Se reemplazará lo capturado con los datos del Excel. ¿Continuar?"))return false;
+    setSol(p=>({...nueva,docs:{...p.docs,solicitud:{archivo,fecha:HOY,metodo:"excel"}},revisiones:p.revisiones}));return true;}
+  async function cargar(slot,file){if(!file)return;cancelRef.current={v:false};setProg({k:slot.k,msg:"Abriendo archivo…",pct:0});
+    try{const r=await solLeerArchivo(file,{onProg:(msg,pct)=>setProg({k:slot.k,msg,pct}),cancel:cancelRef.current});
+      if(r.metodo==="excel"){if(slot.k!=="solicitud"){alert("Para este documento usa PDF o foto; el Excel solo aplica a la solicitud.");return;}
+        if(!importarExcel(r.wb,file.name))return;setTab("validacion");}
+      else{const reg={archivo:file.name,fecha:HOY,metodo:r.metodo,paginas:r.paginas,ocrPags:r.ocrPags};
+        reg.hall=solHallazgos(r.texto,solRef.current,tipoPersona);if(slot.csf)reg.csf=solLeeCSF(r.texto);
+        if(r.texto.replace(/\s/g,"").length<30)alert(`No se pudo leer texto en "${file.name}". Si es foto, que sea nítida, de frente y con buena luz.`);
+        setSol(p=>{const docs={...p.docs};if(slot.multi){const arr=(Array.isArray(docs[slot.k])?docs[slot.k]:[]).filter(d=>d.archivo!==file.name);SOL_TEXTOS[slot.k+"|"+file.name]=r.texto;docs[slot.k]=[...arr,reg];}else{SOL_TEXTOS[slot.k+"|"+file.name]=r.texto;docs[slot.k]=reg;}return {...p,docs};});}
+      if(subirTambien&&subirDoc&&slot.up){setProg({k:slot.k,msg:"Subiendo al expediente (Google Drive)…",pct:1});const ok=await subirDoc(slot.up,file);
+        if(ok)setSol(p=>{const docs={...p.docs};const marca=d=>d&&d.archivo===file.name?{...d,subido:true}:d;docs[slot.k]=Array.isArray(docs[slot.k])?docs[slot.k].map(marca):marca(docs[slot.k]);return {...p,docs};});}
+    }catch(e){alert("No se pudo leer "+file.name+": "+e.message);}
+    finally{setProg(null);}}
+  function revalidar(){let faltan=0;setSol(p=>{const docs={...p.docs};Object.keys(docs).forEach(k=>{const arr=Array.isArray(docs[k])?docs[k]:[docs[k]];const nuevos=arr.map(d=>{const t=d&&SOL_TEXTOS[k+"|"+d.archivo];if(!d||d.metodo==="excel")return d;if(!t){faltan++;return d;}return {...d,hall:solHallazgos(t,p,tipoPersona)};});docs[k]=Array.isArray(docs[k])?nuevos:nuevos[0];});return {...p,docs};});
+    setTimeout(()=>alert(faltan?`Listo. ${faltan} documento(s) se leyeron en otra sesión: vuelve a cargarlos para revalidarlos con los datos actuales.`:"Listo, se revalidaron los documentos con los datos actuales."),50);}
+  function quitarDoc(k,idx){if(!window.confirm("¿Quitar esta lectura? (El archivo en el expediente no se borra.)"))return;setSol(p=>{const docs={...p.docs};if(Array.isArray(docs[k])){docs[k]=docs[k].filter((_,i)=>i!==idx);}else delete docs[k];return {...p,docs};});}
+  function justificar(x){const nota=window.prompt(`Justifica por qué se acepta:\n\n${x.t}`,x.just?x.just.nota:"");if(nota===null)return;
+    setSol(p=>{const rv={...(p.revisiones||{})};if(!nota.trim())delete rv[x.id];else rv[x.id]={nota:nota.trim(),por:(USUARIO&&USUARIO.nombre)||"",fecha:HOY};return {...p,revisiones:rv};});}
+  function aplicar(){const fis=sol.fiscal;const patch={};
+    if(!String(f.cliente||"").trim()&&fis.razonSocial)patch.cliente=fis.razonSocial;
+    if(!String(f.correo||"").trim()&&fis.correo)patch.correo=fis.correo;
+    if(!String(f.telefono||"").trim()&&fis.celular)patch.telefono=fis.celular;
+    if(!f.tipoPersona){const r=solRfc(fis.rfc);if(r.length===12)patch.tipoPersona="Persona moral";else if(r.length===13)patch.tipoPersona="Persona física";}
+    try{localStorage.removeItem(llave);}catch(e){}
+    onAplicar({...sol,actualizado:new Date().toISOString(),resumen:{...res,avance,fecha:HOY}},patch);}
+  function cerrar(){if(!ro&&JSON.stringify(sol)!==JSON.stringify(solNormaliza(f.solicitud))&&!window.confirm("Hay cambios sin aplicar a la tarjeta. ¿Cerrar de todos modos? (Quedan como borrador en este equipo.)"))return;onClose();}
+
+  const grupos=[...new Set(L.map(x=>x.grupo))];
+  const orden={error:0,warn:1,info:2,ok:3};
+  return (<div className="fixed inset-0 z-[60] flex justify-end" style={{background:"rgba(5,15,30,.6)"}} onClick={cerrar}>
+    <div className="flex h-full w-full flex-col bg-[var(--bg)] shadow-2xl sm:max-w-4xl" onClick={e=>e.stopPropagation()}>
+      <datalist id="sol-edocivil">{SOL_EDO_CIVIL.map(x=><option key={x} value={x}/>)}</datalist>
+      <div className="border-b-4 border-lime bg-navy px-4 py-3" style={{paddingTop:"calc(12px + env(safe-area-inset-top,0px))"}}>
+        <div className="flex items-center justify-between gap-3"><div className="min-w-0"><h2 className="font-display truncate text-lg leading-tight text-white">Solicitud Alta de Cliente</h2><p className="truncate text-xs text-slate-300">{f.cliente||sol.fiscal.razonSocial||"Cliente nuevo"} · {tipoPersona}{!f.tipoPersona?" (según RFC)":""}</p></div>
+          <button onClick={cerrar} aria-label="Cerrar" className="grid h-9 w-9 shrink-0 place-items-center rounded border border-navy-edge text-white hover:bg-navy-2"><Icon name="x" size={18}/></button></div>
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+          <span className="rounded-full bg-white/10 px-2.5 py-1 font-semibold text-white">Captura {avance}%</span>
+          <span className={`rounded-full px-2.5 py-1 font-bold ${res.error?"bg-rose-600 text-white":"bg-white/10 text-slate-300"}`}>{res.error} discrepancia{res.error===1?"":"s"}</span>
+          <span className={`rounded-full px-2.5 py-1 font-bold ${res.warn?"bg-amber-400 text-amber-950":"bg-white/10 text-slate-300"}`}>{res.warn} por revisar</span>
+          <span className="rounded-full bg-white/10 px-2.5 py-1 font-semibold text-lime">{res.ok} correctas</span>
+        </div>
+        <div className="mt-3 flex gap-1">{[["captura","Captura"],["documentos","Documentos"],["validacion",`Validación${res.error+res.warn?` (${res.error+res.warn})`:""}`]].map(([k,l])=><button key={k} onClick={()=>setTab(k)} className={`rounded-t-md px-3 py-1.5 text-sm font-semibold ${tab===k?"bg-[var(--bg)] text-navy":"text-slate-300 hover:bg-navy-2"}`}>{l}</button>)}</div>
+      </div>
+
+      <div className="flex-1 space-y-3 overflow-y-auto p-3 sm:p-4">
+        {tab==="captura" && (<>
+          {!ro && <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border-2 border-dashed border-navy/30 bg-white p-3 hover:border-navy">
+            <div><p className="text-sm font-bold text-navy">📥 Importar el Excel de la solicitud</p><p className="text-xs text-slate-500">Llena toda la captura con el formato SOLICITUD ALTA DE CLIENTE que manda el cliente.</p></div>
+            <span className="shrink-0 rounded-md bg-navy px-3 py-1.5 text-xs font-semibold text-white">Elegir Excel</span>
+            <input type="file" accept=".xlsx,.xlsm,.xls" className="hidden" onChange={async e=>{const fl=e.target.files[0];e.target.value="";if(!fl)return;try{const wb=XLSX.read(await fl.arrayBuffer(),{type:"array",cellDates:true});if(importarExcel(wb,fl.name)&&subirTambien&&subirDoc)subirDoc(DOC_MASIVO,fl);}catch(err){alert("No se pudo leer el Excel: "+err.message);}}}/></label>}
+          <SolSec n="1" t="Datos fiscales"><div className="grid grid-cols-2 gap-2 sm:grid-cols-6">
+            <SolIn c="col-span-2 sm:col-span-3" l="Razón social" v={sol.fiscal.razonSocial} on={v=>setF2("fiscal","razonSocial",v)} ro={ro}/>
+            <SolIn c="col-span-2 sm:col-span-3" l="Nombre comercial" v={sol.fiscal.nombreComercial} on={v=>setF2("fiscal","nombreComercial",v)} ro={ro}/>
+            <SolIn c="col-span-2 sm:col-span-3" l="Calle y número" v={sol.fiscal.calle} on={v=>setF2("fiscal","calle",v)} ro={ro}/>
+            <SolIn c="col-span-1 sm:col-span-2" l="Colonia" v={sol.fiscal.colonia} on={v=>setF2("fiscal","colonia",v)} ro={ro}/>
+            <SolIn c="col-span-1 sm:col-span-1" l="C.P." v={sol.fiscal.cp} on={v=>setF2("fiscal","cp",v)} ro={ro} mono/>
+            <SolIn c="col-span-1 sm:col-span-2" l="Municipio" v={sol.fiscal.municipio} on={v=>setF2("fiscal","municipio",v)} ro={ro}/>
+            <SolIn c="col-span-1 sm:col-span-2" l="Estado" v={sol.fiscal.estado} on={v=>setF2("fiscal","estado",v)} ro={ro}/>
+            <SolIn c="col-span-2 sm:col-span-2" l="RFC" v={sol.fiscal.rfc} on={v=>setF2("fiscal","rfc",v)} ro={ro} mono/>
+            <SolIn c="col-span-2 sm:col-span-3" l="Contacto directo" v={sol.fiscal.contacto} on={v=>setF2("fiscal","contacto",v)} ro={ro}/>
+            <SolIn c="col-span-1 sm:col-span-1" l="Tel. celular" v={sol.fiscal.celular} on={v=>setF2("fiscal","celular",v)} ro={ro} mono/>
+            <SolIn c="col-span-1 sm:col-span-2" l="Correo" v={sol.fiscal.correo} on={v=>setF2("fiscal","correo",v)} ro={ro}/>
+            <SolIn c="col-span-1 sm:col-span-3" l="Página web / redes" v={sol.fiscal.web} on={v=>setF2("fiscal","web",v)} ro={ro}/>
+            <SolIn c="col-span-1 sm:col-span-3" l="Tipo de cliente (solicitud)" v={sol.fiscal.tipoCliente} on={v=>setF2("fiscal","tipoCliente",v)} ro={ro}/>
+          </div></SolSec>
+          <SolSec n="2" t="Representante legal" extra={!moral&&<span className="text-[11px] text-slate-500">Persona física: opcional</span>}><SolPersona p={sol.rep} on={v=>setSol(p=>({...p,rep:v}))} ro={ro}/></SolSec>
+          <SolSec n="3" t={`Aval${sol.avales.length>1?"es":""}`} extra={!ro&&<button onClick={()=>setSol(p=>({...p,avales:[...p.avales,{...solPersona(),tiempo:"",parentesco:""}]}))} className="text-xs font-semibold text-navy hover:underline">+ Agregar aval</button>}>
+            <div className="space-y-3">{sol.avales.map((a,i)=>(<div key={i} className={i?"border-t border-stone-200 pt-3":""}>
+              <div className="mb-1.5 flex items-center justify-between"><span className="text-xs font-bold uppercase text-slate-500">Aval {i+1}</span>{!ro&&sol.avales.length>1&&<button onClick={()=>{if(window.confirm("¿Quitar este aval?"))setSol(p=>({...p,avales:p.avales.filter((_,j)=>j!==i)}));}} className="text-[11px] font-semibold text-slate-400 hover:text-red-500">Quitar</button>}</div>
+              <SolPersona aval p={a} on={v=>setSol(p=>({...p,avales:p.avales.map((x,j)=>j===i?v:x)}))} ro={ro}/></div>))}</div></SolSec>
+          <SolSec n="4" t="Responsable de pagos"><div className="grid grid-cols-2 gap-2 sm:grid-cols-6">
+            <SolIn c="col-span-2 sm:col-span-4" l="Nombre completo" v={sol.pagos.nombre} on={v=>setF2("pagos","nombre",v)} ro={ro}/>
+            <SolIn c="col-span-1 sm:col-span-1" l="Tel. celular" v={sol.pagos.celular} on={v=>setF2("pagos","celular",v)} ro={ro} mono/>
+            <SolIn c="col-span-1 sm:col-span-1" l="Tel. oficina" v={sol.pagos.telOficina} on={v=>setF2("pagos","telOficina",v)} ro={ro} mono/>
+            {[["usoCfdi","Uso CFDI",SOL_USO_CFDI],["metodoPago","Método de pago",SOL_METODO],["formaPago","Forma de pago",SOL_FORMA]].map(([k,l,ops])=>(<label key={k} className="col-span-2 block sm:col-span-2"><span className="block text-[10px] font-semibold uppercase tracking-wide text-slate-500">{l}</span>
+              <select value={sol.pagos[k]} disabled={ro} onChange={e=>setF2("pagos",k,e.target.value)} className="mt-0.5 w-full rounded-md border border-stone-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-navy disabled:bg-stone-50"><option value="">— Selecciona —</option>{ops.map(o=><option key={o}>{o}</option>)}{sol.pagos[k]&&ops.indexOf(sol.pagos[k])<0&&<option>{sol.pagos[k]}</option>}</select></label>))}
+            <SolIn c="col-span-2 sm:col-span-6" l="Correos para envío de facturas (separa con coma)" v={sol.pagos.correosFactura} on={v=>setF2("pagos","correosFactura",v)} ro={ro}/>
+            <SolIn c="col-span-2 sm:col-span-6" l="Comentarios" v={sol.pagos.comentarios} on={v=>setF2("pagos","comentarios",v)} ro={ro}/>
+          </div></SolSec>
+          <SolSec n="5" t="Referencias" extra={<span className="text-[11px] text-slate-500">Mínimo {SOL_MIN_REF} de cada tipo, con teléfono</span>}>
+            <SolRefs titulo="Familiares" lista={sol.refFam} ro={ro} on={v=>setSol(p=>({...p,refFam:v}))} cols={[["nombre","Nombre completo","col-span-2 sm:col-span-4"],["direccion","Dirección completa","col-span-2 sm:col-span-4"],["telefono","Teléfono","col-span-1 sm:col-span-2"],["parentesco","Parentesco","col-span-1 sm:col-span-2"]]}/>
+            <SolRefs titulo="Principales clientes" lista={sol.refCli} ro={ro} on={v=>setSol(p=>({...p,refCli:v}))} cols={[["empresa","Empresa","col-span-2 sm:col-span-4"],["contacto","Contacto","col-span-2 sm:col-span-4"],["telefono","Teléfono","col-span-1 sm:col-span-2"],["tiempo","Tiempo de conocerlo","col-span-1 sm:col-span-2"]]}/>
+            <SolRefs titulo="Principales proveedores" lista={sol.refProv} ro={ro} on={v=>setSol(p=>({...p,refProv:v}))} cols={[["empresa","Empresa","col-span-2 sm:col-span-4"],["contacto","Contacto","col-span-2 sm:col-span-4"],["telefono","Teléfono","col-span-1 sm:col-span-2"],["tiempo","Tiempo de conocerlo","col-span-1 sm:col-span-2"]]}/>
+            <p className="mt-2 text-[11px] text-slate-500">No cuentan como referencia comercial: el proveedor de combustible, negocios con participación accionaria del cliente ni negocios de familiares directos.</p>
+          </SolSec>
+          <SolSec n="6" t="Referencias bancarias" extra={!ro&&<button onClick={()=>setSol(p=>({...p,bancos:[...p.bancos,{banco:"",cuenta:"",apertura:"",saldo:"",ejecutivo:"",telefono:""}]}))} className="text-xs font-semibold text-navy hover:underline">+ Agregar banco</button>}>
+            <div className="space-y-2">{sol.bancos.map((b,i)=>{const s=(k,v)=>setSol(p=>({...p,bancos:p.bancos.map((x,j)=>j===i?{...x,[k]:v}:x)}));return (<div key={i} className="grid grid-cols-2 gap-2 rounded-lg border border-stone-200 bg-stone-50/60 p-2 sm:grid-cols-6">
+              <SolIn l="Banco" v={b.banco} on={v=>s("banco",v)} ro={ro}/><SolIn l="No. cuenta" v={b.cuenta} on={v=>s("cuenta",v)} ro={ro} mono/><SolIn l="Apertura" type="date" v={b.apertura} on={v=>s("apertura",v)} ro={ro}/>
+              <SolIn l="Saldo promedio" v={b.saldo} on={v=>s("saldo",v)} ro={ro} mono/><SolIn l="Ejecutivo" v={b.ejecutivo} on={v=>s("ejecutivo",v)} ro={ro}/><SolIn l="Teléfono" v={b.telefono} on={v=>s("telefono",v)} ro={ro} mono/></div>);})}</div></SolSec>
+          <SolSec n="7" t="Equipo de transporte" extra={<span className="text-[11px] text-slate-500">Unidades con las que moverán nuestros equipos</span>}>
+            <div className="space-y-2">{sol.transporte.map((t,i)=>{const s=(k,v)=>setSol(p=>({...p,transporte:p.transporte.map((x,j)=>j===i?{...x,[k]:v}:x)}));return (<div key={i} className="grid grid-cols-2 gap-2 rounded-lg border border-stone-200 bg-stone-50/60 p-2 sm:grid-cols-6">
+              <SolIn l="Clase" v={t.clase} on={v=>s("clase",v)} ro={ro}/><SolIn l="Tipo de equipo" v={t.tipo} on={v=>s("tipo",v)} ro={ro}/><SolIn l="Marca" v={t.marca} on={v=>s("marca",v)} ro={ro}/>
+              <SolIn l="Modelo" v={t.modelo} on={v=>s("modelo",v)} ro={ro}/><SolIn l="Placa" v={t.placa} on={v=>s("placa",v)} ro={ro} mono/><SolIn l="Color" v={t.color} on={v=>s("color",v)} ro={ro}/></div>);})}
+              {!ro && <button onClick={()=>setSol(p=>({...p,transporte:[...p.transporte,{clase:"",tipo:"",marca:"",modelo:"",placa:"",color:""}]}))} className="text-xs font-semibold text-navy hover:underline">+ Agregar unidad</button>}</div></SolSec>
+        </>)}
+
+        {tab==="documentos" && (<>
+          <div className="rounded-xl border border-sky-200 bg-sky-50 p-3 text-xs text-sky-900">
+            <p className="font-bold">Cómo funciona (sin costo)</p>
+            <p className="mt-0.5">El documento se lee aquí mismo en tu navegador: los PDF descargados del SAT o generados en computadora se leen exactos; los escaneos y fotos pasan por reconocimiento de texto (OCR), que es más lento (unos segundos por página) y puede fallar con fotos borrosas. Las actas largas pueden tardar varios minutos.</p>
+            {!ro && <label className="mt-2 flex items-center gap-2 font-semibold"><input type="checkbox" checked={subirTambien} onChange={e=>setSubirTambien(e.target.checked)} className="h-4 w-4"/> Subir también el archivo al expediente y marcar el requisito como recibido</label>}
+          </div>
+          {slots.map(slot=>{const regs=Array.isArray(sol.docs[slot.k])?sol.docs[slot.k]:(sol.docs[slot.k]?[sol.docs[slot.k]]:[]);const activo=prog&&prog.k===slot.k;
+            return (<div key={slot.k} className="rounded-xl border border-stone-200 bg-white p-3">
+              <div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0 flex-1"><p className="text-sm font-bold text-navy">{slot.l}</p><p className="text-[11px] text-slate-500">{slot.d}</p></div>
+                {!ro && <label className={`shrink-0 cursor-pointer rounded-md px-3 py-1.5 text-xs font-semibold ${prog?"pointer-events-none bg-stone-200 text-stone-400":"bg-navy text-white hover:bg-navy-2"}`}>{regs.length&&!slot.multi?"Volver a cargar":"📄 Cargar y validar"}
+                  <input type="file" className="hidden" accept={slot.acc||".pdf,image/*"} disabled={!!prog} onChange={e=>{const fl=e.target.files[0];e.target.value="";cargar(slot,fl);}}/></label>}</div>
+              {activo && <div className="mt-2"><div className="h-2 overflow-hidden rounded-full bg-stone-200"><div className="h-full bg-lime transition-all" style={{width:Math.round((prog.pct||0)*100)+"%"}}/></div>
+                <div className="mt-1 flex items-center justify-between text-[11px] text-slate-600"><span>{prog.msg}</span><button onClick={()=>{cancelRef.current.v=true;}} className="font-semibold text-red-600 hover:underline">Cancelar</button></div></div>}
+              {regs.map((d,i)=><div key={i} className="mt-2 flex flex-wrap items-center gap-2 rounded-lg bg-stone-50 px-2.5 py-1.5 text-[11px]">
+                <span className="min-w-0 flex-1 truncate font-semibold text-slate-700" title={d.archivo}>📄 {d.archivo}</span>
+                <span className="text-slate-500">{d.fecha} · {d.metodo==="excel"?"Excel":d.metodo==="texto"?"texto exacto":d.metodo==="ocr"?"OCR":"texto + OCR"}{d.paginas?` · ${d.paginas} pág.`:""}</span>
+                {d.subido && <span className="rounded bg-emerald-100 px-1.5 font-semibold text-emerald-700">en expediente</span>}
+                {SOL_TEXTOS[slot.k+"|"+d.archivo]?null:(d.metodo!=="excel"&&<span className="text-slate-400" title="Para revalidar con datos nuevos hay que volver a cargarlo">leído en otra sesión</span>)}
+                {!ro && <button onClick={()=>quitarDoc(slot.k,i)} className="text-slate-400 hover:text-red-500" aria-label="Quitar lectura"><Icon name="x" size={13}/></button>}</div>)}
+            </div>);})}
+          {!ro && Object.keys(sol.docs).length>0 && <button onClick={revalidar} className="w-full rounded-lg border border-navy bg-white px-3 py-2 text-sm font-semibold text-navy hover:bg-stone-50">↻ Revalidar documentos con la captura actual</button>}
+        </>)}
+
+        {tab==="validacion" && (<>
+          {grupos.map(g=>{const items=L.filter(x=>x.grupo===g).sort((a,b)=>orden[a.n]-orden[b.n]);return (<SolSec key={g} t={g} extra={<span className="text-[11px] text-slate-500">{items.filter(x=>x.n==="ok"||x.just).length} de {items.length} en orden</span>}>
+            <ul className="space-y-1.5">{items.map(x=>{const [ic,cl]=SOL_ICONO[x.n];const j=x.just&&x.n!=="ok";return (<li key={x.id} className={`flex items-start gap-2 rounded-lg px-2 py-1.5 text-sm ${j?"bg-stone-50":x.n==="error"?"bg-rose-50":x.n==="warn"?"bg-amber-50":""}`}>
+              <span className={`mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full text-[11px] font-bold ${j?"bg-stone-300 text-stone-700":cl}`}>{j?"✓":ic}</span>
+              <div className="min-w-0 flex-1"><p className={j?"text-slate-500 line-through decoration-slate-300":"text-slate-800"}>{x.t}</p>{j && <p className="text-[11px] text-slate-600">Justificado: {x.just.nota} — {x.just.por} {x.just.fecha}</p>}</div>
+              {!ro && (x.n==="error"||x.n==="warn") && <button onClick={()=>justificar(x)} className="shrink-0 text-[11px] font-semibold text-navy hover:underline">{j?"Editar":"Justificar"}</button>}
+            </li>);})}</ul></SolSec>);})}
+          <p className="text-[11px] text-slate-500">✕ discrepancia o regla incumplida · ! revisar a ojo · i aviso para Legal · ✓ correcto. Las reglas de representante y avales son una ayuda: el dictamen lo emite Legal.</p>
+        </>)}
+      </div>
+
+      <div className="flex items-center justify-end gap-2 border-t border-stone-200 bg-white px-4 py-3" style={{paddingBottom:"calc(12px + env(safe-area-inset-bottom,0px))"}}>
+        {!ro && <span className="mr-auto hidden text-[11px] text-slate-400 sm:block">Después de aplicar, da clic en “Guardar cambios” de la tarjeta.</span>}
+        <button onClick={cerrar} className="rounded-lg px-3.5 py-2 text-sm font-semibold text-slate-600 hover:bg-stone-100">{ro?"Cerrar":"Cancelar"}</button>
+        {!ro && <button onClick={aplicar} disabled={!!prog} className="rounded-lg border border-lime bg-lime px-5 py-2 text-sm font-bold text-lime-dark hover:brightness-95 disabled:opacity-40">Aplicar a la tarjeta</button>}
+      </div>
+    </div></div>);}
+
+/* resumen dentro de la tarjeta */
+function SolicitudResumen({f,onAbrir,sinGuardar}){const sol=f.solicitud;const tp=f.tipoPersona||(sol&&solRfc((sol.fiscal||{}).rfc).length===13?"Persona física":"Persona moral");
+  const L=sol?solValidar(solNormaliza(sol),tp):[];const r=solResumen(L);const av=sol?solAvance(solNormaliza(sol),tp):0;
+  return (<div className="rounded-xl border border-navy/20 bg-white p-3">
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="min-w-0"><h3 className="inline-flex items-center gap-1.5 text-sm font-bold text-navy"><Icon name="clip" size={15}/> Solicitud Alta de Cliente</h3>
+        <p className="text-[11px] text-slate-500">{sol?`Captura ${av}% · ${Object.keys(sol.docs||{}).length} documento(s) leído(s)`:"Sin capturar · importa el Excel o captura a mano"}</p></div>
+      <button onClick={onAbrir} className="shrink-0 rounded-lg border border-navy bg-navy px-3 py-1.5 text-xs font-semibold text-white hover:bg-navy-2">{sol?"Abrir solicitud":"Capturar solicitud"}</button></div>
+    {sol && <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] font-semibold">
+      <span className={`rounded-full px-2 py-0.5 ${r.error?"bg-rose-100 text-rose-700":"bg-stone-100 text-slate-500"}`}>{r.error} discrepancia{r.error===1?"":"s"}</span>
+      <span className={`rounded-full px-2 py-0.5 ${r.warn?"bg-amber-100 text-amber-800":"bg-stone-100 text-slate-500"}`}>{r.warn} por revisar</span>
+      <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-emerald-700">{r.ok} correctas</span>
+      {sinGuardar && <span className="rounded-full bg-amber-400 px-2 py-0.5 text-amber-950">Sin guardar · da clic en Guardar cambios</span>}</div>}
+    {sol && r.error>0 && <ul className="mt-2 space-y-0.5 text-[11px] text-rose-700">{L.filter(x=>x.n==="error"&&!x.just).slice(0,4).map(x=><li key={x.id}>✕ {x.t}</li>)}{r.error>4&&<li className="text-slate-500">…y {r.error-4} más</li>}</ul>}
+  </div>);}
+
 function Modal({inicial,fEjec,ejecutivos,cliPorEjec,onClose,onSave,puedeEditar,onCambiado,onEliminado}){
   const [eliminando,setEliminando]=useState(false);
   async function eliminarTarjeta(){
@@ -1138,6 +1702,15 @@ function Modal({inicial,fEjec,ejecutivos,cliPorEjec,onClose,onSave,puedeEditar,o
     try{setSubiendo(docKey);const c=await comprimir(file);const j=await apiUpload(String(f.cliente).trim(),docKey,c.nombre,c.mime,c.b64);
       setF(p=>({...p,archivos:{...(p.archivos||{}),[docKey]:[...(((p.archivos||{})[docKey])||[]),{id:j.id,url:j.url,nombre:c.nombre,fecha:HOY}]}}));setSubiendo("");
     }catch(err){setSubiendo("");alert("No se pudo subir: "+err.message);}
+  }
+  const [solAbierta,setSolAbierta]=useState(false);const [solSinGuardar,setSolSinGuardar]=useState(false);
+  async function subirDesdeSolicitud(docKey,file){
+    if(!puedeEditar||!CLOUD)return false;
+    if(!String(f.cliente||"").trim()){alert("Captura primero el nombre del cliente en la tarjeta para poder subir el archivo a su carpeta. La lectura sí quedó registrada.");return false;}
+    try{const c=await comprimir(file);const j=await apiUpload(String(f.cliente).trim(),docKey,c.nombre,c.mime,c.b64);
+      setF(p=>{const req={...p.requisitos};if(Object.prototype.hasOwnProperty.call(req,docKey))req[docKey]="recibido";return {...p,requisitos:req,archivos:{...(p.archivos||{}),[docKey]:[...(((p.archivos||{})[docKey])||[]),{id:j.id,url:j.url,nombre:c.nombre,fecha:HOY}]}};});
+      setSolSinGuardar(true);return true;
+    }catch(err){alert("Se leyó el documento, pero no se pudo subir al expediente: "+err.message);return false;}
   }
   const [progMasivo,setProgMasivo]=useState("");
   async function subirVarios(docKey,files){
@@ -1273,6 +1846,7 @@ function Modal({inicial,fEjec,ejecutivos,cliPorEjec,onClose,onSave,puedeEditar,o
 
         <Campo label="Estatus de la solicitud (marca todas las etapas que apliquen)"><div className="flex flex-wrap gap-1.5">{ESTATUS.map(est=>{const on=(f.estatuses||[]).includes(est);return <button key={est} onClick={()=>toggleEst(est)} className={`rounded-full border px-2.5 py-1 text-xs font-medium ${on?ESTATUS_COLOR[est].chip+" ring-2 ring-offset-1 ring-slate-300":"border-stone-300 text-slate-500 hover:bg-stone-50"}`}>{on?"✓ ":""}{est}</button>;})}</div><span className="mt-1.5 block text-[11px] text-slate-400">En el tablero y los conteos aparece según la etapa más avanzada marcada: <span className="font-semibold text-slate-600">{principal(f.estatuses||[])}</span></span></Campo>
 
+        <SolicitudResumen f={f} sinGuardar={solSinGuardar} onAbrir={()=>setSolAbierta(true)}/>
         <div className="rounded-xl border border-stone-200 bg-stone-50 p-3"><div className="flex items-center justify-between mb-2"><div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500"><Icon name="clip" size={14}/> Requisitos · {f.tipoCliente==="Cliente Recurrente"?"Recurrente":"Nuevo"}</div><span className={`text-xs font-bold mono ${st.completo?"text-emerald-600":"text-indigo-600"}`}>{st.completo?"Completo":`${st.recibido}/${st.aplicables}`}</span></div><p className="text-xs text-slate-400 mb-2">Clic para alternar: <span className="text-slate-500 font-medium">Pendiente → Recibido → No aplica</span> · 📷 escanea con la cámara · 📎 sube archivo o PDF</p><div className="space-y-1.5">{reqListFor(f.tipoCliente).map(k=>{const v=f.requisitos[k]||"pendiente";const s=v==="recibido"?"bg-emerald-600 text-white border-emerald-600":v==="na"?"bg-stone-100 text-slate-400 border-stone-200 line-through":"bg-white border-stone-300 text-slate-600 hover:bg-stone-50";const lista=((f.archivos||{})[k])||[];return (<div key={k} className="rounded-lg border border-stone-200 bg-white p-1.5"><div className="flex items-center gap-1.5"><button onClick={()=>ciclaReq(k)} className={`flex flex-1 min-w-0 items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium text-left ${s}`}><span className="shrink-0">{v==="recibido"?<Icon name="check" size={13}/>:v==="na"?<Icon name="x" size={12}/>:<span className="inline-block h-3 w-3 rounded-full border border-current opacity-40"></span>}</span><span className="truncate">{k}</span>{lista.length>0&&<span className="ml-auto shrink-0 rounded-full bg-black/10 px-1.5 py-0.5 text-[10px] font-bold">{lista.length}</span>}</button><label title="Escanear con la cámara" className="cursor-pointer shrink-0 rounded-md border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100">📷<input type="file" accept="image/*" capture="environment" className="hidden" onChange={e=>{const fl=e.target.files[0];if(fl)subirArchivo(k,fl);e.target.value="";}}/></label><label title="Subir archivo o PDF" className="cursor-pointer shrink-0 rounded-md border border-stone-300 bg-white px-2 py-1.5 text-xs font-semibold text-slate-600 hover:bg-stone-50">📎<input type="file" accept="image/*,application/pdf" className="hidden" onChange={e=>{const fl=e.target.files[0];if(fl)subirArchivo(k,fl);e.target.value="";}}/></label></div>{subiendo===k && <p className="mt-1 text-[11px] font-medium text-sky-600">Subiendo…</p>}{lista.length>0 && <div className="mt-1.5 flex flex-wrap gap-1.5">{lista.map((a,i)=>(<div key={i} className="relative"><a href={a.url} target="_blank" rel="noopener"><img src={`https://drive.google.com/thumbnail?id=${a.id}&sz=w120`} alt={a.nombre} className="h-12 w-12 rounded border border-stone-200 object-cover bg-stone-50"/></a><button onClick={()=>quitarArchivo(k,i)} className="absolute -right-1 -top-1 grid h-4 w-4 place-items-center rounded-full border border-stone-200 bg-white text-slate-400 shadow hover:text-red-500"><Icon name="x" size={9}/></button></div>))}</div>}</div>);})}</div>{f.tipoCliente==="Cliente Recurrente" && <CargaMasiva lista={((f.archivos||{})[DOC_MASIVO])||[]} subiendo={subiendo===DOC_MASIVO} progreso={progMasivo} puedeEditar={puedeEditar} onArchivos={fl=>subirVarios(DOC_MASIVO,fl)} onQuitar={i=>quitarArchivo(DOC_MASIVO,i)}/>}</div>
 
         <Campo label="Pendiente actual (nota)"><textarea value={f.queFalta} onChange={e=>set("queFalta",e.target.value)} rows={2} placeholder="Algo fuera del expediente (ej. cliente confirma plazo)…" className={inp}/></Campo>
@@ -1283,6 +1857,7 @@ function Modal({inicial,fEjec,ejecutivos,cliPorEjec,onClose,onSave,puedeEditar,o
         {inicial && inicial.id>0 && USUARIO && <BloqueDictamen r={{...inicial,requisitos:f.requisitos,tipoCliente:f.tipoCliente,tipoPersona:f.tipoPersona,estatuses:f.estatuses,enviadoLegal:f.enviadoLegal,abogadoDictamen:f.abogadoDictamen,dictamenLegal:f.dictamenLegal,archivos:f.archivos||inicial.archivos}} expedienteCompleto={listoParaDictamen({...inicial,requisitos:f.requisitos,tipoCliente:f.tipoCliente})} onAplicar={patch=>setF(p=>{const es=Array.from(new Set([...(p.estatuses||[]),...(patch.agregar||[])]));return {...p,...(patch.campos||{}),estatuses:es,estatus:principal(es)};})} onCambio={onCambiado}/>}
         {inicial && inicial.id>0 && USUARIO && <HistorialCambios id={inicial.id}/>}
       </div>
+      {solAbierta && <SolicitudAlta f={f} puedeEditar={puedeEditar} subirDoc={subirDesdeSolicitud} onClose={()=>setSolAbierta(false)} onAplicar={(sol,patch)=>{setF(p=>({...p,...patch,solicitud:sol}));setSolSinGuardar(true);setSolAbierta(false);}}/>}
       <div className="sticky bottom-0 flex justify-end gap-2 border-t border-stone-200 bg-white px-5 py-3">{inicial && inicial.id>0 && puedeEditar && !ES_LEGAL() && <button onClick={eliminarTarjeta} disabled={eliminando} className="mr-auto rounded-lg border border-red-200 bg-white px-3.5 py-2 text-sm font-semibold text-red-600 hover:bg-red-50 disabled:opacity-40">{eliminando?"Eliminando…":"🗑 Eliminar tarjeta"}</button>}<button onClick={onClose} className="rounded-lg px-3.5 py-2 text-sm font-semibold text-slate-600 hover:bg-stone-100">Cancelar</button><button onClick={()=>valido&&guardarLimpio()} disabled={!valido||!puedeEditar} title={puedeEditar?"":"Modo consulta: no puedes guardar"} className="rounded-lg border border-lime bg-lime px-5 py-2 text-sm font-bold text-lime-dark hover:brightness-95 disabled:opacity-40">{inicial?"Guardar cambios":"Crear cliente"}</button></div>
     </div>
   </div>);
