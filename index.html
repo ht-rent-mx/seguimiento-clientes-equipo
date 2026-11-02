@@ -1141,7 +1141,6 @@ const SOL_METODO=["PUE / PAGO UNA EXHIBICION","PPD / PAGO EN PARCIALIDADES"];
 const SOL_FORMA=["EFECTIVO","CHEQUE","TRANSFERENCIA ELECTRONICA","POR DEFINIR"];
 const SOL_EDO_CIVIL=["SOLTERO","CASADO","UNIÓN LIBRE","DIVORCIADO","VIUDO"];
 const SOL_CLASES_TR=["Tractocamiones","Remolques","Camiones"];
-const SOL_COMBUSTIBLE=/GASOLIN|COMBUSTIBLE|DIESEL|PEMEX|GAS\s?NATURAL|OXXO\s?GAS|G500|ESTACION DE SERVICIO|PETRO|MOBIL|SHELL|BP\b|REPSOL|ARCO\b|TOTAL\s?ENERG/;
 const SOL_PARTICULAS=new Set(["DE","DEL","LA","LAS","LOS","Y","E","MC","MAC","VON","VAN","DA","DI","DAS","EL"]);
 
 /* ---------- estructura vacía ---------- */
@@ -1330,11 +1329,6 @@ function solValidar(sol,tipoPersona){
   sol.refFam.forEach(r=>marca(r.telefono,"ref. familiar "+(r.nombre||"")));sol.refCli.forEach(r=>marca(r.telefono,"ref. cliente "+(r.empresa||"")));sol.refProv.forEach(r=>marca(r.telefono,"ref. proveedor "+(r.empresa||"")));
   const propios=new Set([fis.celular,sol.rep.celular,...sol.avales.map(a=>a.celular)].map(x=>solSoloDig(x).slice(-10)).filter(x=>x.length===10));
   Object.keys(tels).forEach(t=>{if(tels[t].length>1)add("Referencias","ref-dup-"+t,"warn",`Mismo teléfono ${t} en: ${tels[t].join(" · ")}`);if(propios.has(t))add("Referencias","ref-propio-"+t,"error",`El teléfono ${t} de ${tels[t][0]} es del propio cliente, representante o aval`);});
-  const apellidos=new Set([...solTokens(sol.rep.nombre).slice(-2),...sol.avales.flatMap(a=>solTokens(a.nombre).slice(-2))].filter(t=>t.length>3));
-  [...sol.refCli.map(r=>["cliente",r]),...sol.refProv.map(r=>["proveedor",r])].forEach(([tipo,r],i)=>{const nom=[r.empresa,r.contacto].join(" ");if(vacio(nom))return;
-    if(SOL_COMBUSTIBLE.test(solN(nom)))add("Referencias","ref-comb-"+i,"error",`"${r.empresa}" parece proveedor de combustible: no cuenta como referencia comercial`);
-    const fam=solTokens(nom).filter(t=>apellidos.has(t));if(fam.length)add("Referencias","ref-fam-"+i,"warn",`Ref. de ${tipo} "${r.empresa}" comparte apellido (${fam.join(", ")}) con el representante o aval: confirmar que no sea negocio de familiar directo`);});
-
   /* 3. RFC, edad y reglas de personas */
   const tipoCli=moral?"moral":"fisica";
   solRevisaRfc(fis.rfc,fis.razonSocial,tipoCli).forEach((x,i)=>add("RFC y personas","rfc-cli-"+i,x.n,"Cliente: "+x.t));
@@ -1609,7 +1603,6 @@ function SolicitudAlta({f,puedeEditar,onClose,onAplicar,subirDoc}){
             <SolRefs titulo="Familiares" lista={sol.refFam} ro={ro} on={v=>setSol(p=>({...p,refFam:v}))} cols={[["nombre","Nombre completo","col-span-2 sm:col-span-4"],["direccion","Dirección completa","col-span-2 sm:col-span-4"],["telefono","Teléfono","col-span-1 sm:col-span-2"],["parentesco","Parentesco","col-span-1 sm:col-span-2"]]}/>
             <SolRefs titulo="Principales clientes" lista={sol.refCli} ro={ro} on={v=>setSol(p=>({...p,refCli:v}))} cols={[["empresa","Empresa","col-span-2 sm:col-span-4"],["contacto","Contacto","col-span-2 sm:col-span-4"],["telefono","Teléfono","col-span-1 sm:col-span-2"],["tiempo","Tiempo de conocerlo","col-span-1 sm:col-span-2"]]}/>
             <SolRefs titulo="Principales proveedores" lista={sol.refProv} ro={ro} on={v=>setSol(p=>({...p,refProv:v}))} cols={[["empresa","Empresa","col-span-2 sm:col-span-4"],["contacto","Contacto","col-span-2 sm:col-span-4"],["telefono","Teléfono","col-span-1 sm:col-span-2"],["tiempo","Tiempo de conocerlo","col-span-1 sm:col-span-2"]]}/>
-            <p className="mt-2 text-[11px] text-slate-500">No cuentan como referencia comercial: el proveedor de combustible, negocios con participación accionaria del cliente ni negocios de familiares directos.</p>
           </SolSec>
           <SolSec n="6" t="Referencias bancarias" extra={!ro&&<button onClick={()=>setSol(p=>({...p,bancos:[...p.bancos,{banco:"",cuenta:"",apertura:"",saldo:"",ejecutivo:"",telefono:""}]}))} className="text-xs font-semibold text-navy hover:underline">+ Agregar banco</button>}>
             <div className="space-y-2">{sol.bancos.map((b,i)=>{const s=(k,v)=>setSol(p=>({...p,bancos:p.bancos.map((x,j)=>j===i?{...x,[k]:v}:x)}));return (<div key={i} className="grid grid-cols-2 gap-2 rounded-lg border border-stone-200 bg-stone-50/60 p-2 sm:grid-cols-6">
