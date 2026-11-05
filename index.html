@@ -1317,7 +1317,8 @@ const SOL_SECCION=[
   ["bancos",/^REFERENCIAS BANCARIAS$/],["transporte",/^(EQUIPO|EQUIPOS|UNIDADES) (DE )?TRANSPORTE$/],
   ["fiscal",/^DATOS (FISCALES|GENERALES|DEL CLIENTE)$/],["rep",/^(DATOS DEL |INFORMACION DEL )?REPRESENTANTE LEGAL$/],
   ["aval",/^((INFORMACION|DATOS) (DEL )?)?(AVAL|OBLIGADO SOLIDARIO)( \d+)?$/],["pagos",/^(DATOS DEL )?RESPONSABLE DE (LOS )?PAGOS?$/],
-  ["refs",/^REFERENCIAS( PERSONALES| COMERCIALES| FAMILIARES Y COMERCIALES)?$/]];
+  ["refs",/^REFERENCIAS( PERSONALES| COMERCIALES| FAMILIARES Y COMERCIALES)?$/],
+  ["operativo",/^DOMICILIO (OPERATIVO|DE OPERACION|DE RESGUARDO)|^RESGUARDO DE UNIDADES/]]; // no se captura, solo corta la sección anterior
 function solTxtCelda(v){if(v==null)return "";if(v instanceof Date)return isNaN(v)?"":v.toISOString().slice(0,10);if(typeof v==="number")return Number.isInteger(v)?String(v):String(v);return String(v).trim();}
 function solEsEtiqueta(N){if(!N||N.length>60)return null;for(const k in SOL_LBL)if(SOL_LBL[k].test(N))return k;return null;}
 function solEsNota(N){return /^(NOTA|NO APLICA|DATOS DE LAS UNIDADES|LA SOLICITUD DEBE)/.test(N);}
@@ -1331,7 +1332,7 @@ function solDesdeExcel(wb){
   const {G,n:hoja}=cands[0]||{G:[]};
   const T=G.map(r=>(r||[]).map(c=>solTxtCelda(c)));const N=T.map(r=>r.map(c=>solN(c)));
   /* secciones */
-  const secs=[];N.forEach((row,r)=>{for(let c=0;c<row.length;c++){const x=row[c];if(!x||x.length>45)continue;const s=SOL_SECCION.find(([,re])=>re.test(x));if(s){secs.push({tipo:s[0],r});break;}}});
+  const secs=[];N.forEach((row,r)=>{for(let c=0;c<row.length;c++){const x=row[c];if(!x||x.length>60)continue;const s=SOL_SECCION.find(([,re])=>re.test(x));if(s){secs.push({tipo:s[0],r});break;}}});
   if(!secs.length||secs[0].tipo!=="fiscal")secs.unshift({tipo:"fiscal",r:-1});
   secs.forEach((s,i)=>s.fin=i+1<secs.length?secs[i+1].r:N.length);
   const valorDerecha=(r,c)=>{const row=T[r];for(let j=c+1;j<row.length;j++){if(!row[j])continue;const n=N[r][j];if(solEsEtiqueta(n))return "";if(solEsNota(n))continue;return row[j];}return "";};
